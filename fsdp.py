@@ -4,6 +4,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.distributed_c10d import _get_default_group
 
 
 from model import MLP, DataloaderLite, generate_dataset
@@ -46,7 +47,7 @@ class FlatParameterHandle:
 
 class FSDP(nn.Module):
 
-    def __init__(self, module: nn.Module, process_group):
+    def __init__(self, module: nn.Module):
         """
         split module into units, 1 layer -> 1 unit, map?
         convert each unit into a flat parameter
@@ -59,8 +60,15 @@ class FSDP(nn.Module):
         super().__init__()
         self.module = module
 
+        # get default group created by init_process_group
+        self.process_group = _get_default_group()
+        self.rank = self.process_group.rank()
+        self.world_size = self.process_group.world_size()
+
+        self.__init_param_from_module()
+
     def _init_param_from_module(self):
-        # init process group -> we'll pass the list pd
+
         # check where module is initialized
         # materialize module if needed
         # get modules to materialize;
@@ -69,7 +77,7 @@ class FSDP(nn.Module):
         # sync module states
         # using flatparamhandle to flatten params
         # handle.shard
-        pass
+        print(f"Hello in FSDP from rank {self.rank} of {self.world_size}")
 
     def forward(self):
         # root_pre_forward
@@ -155,7 +163,7 @@ def init_process(rank=None, world_size=None, fn=None, backend="gloo", cuda=False
         os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
         dist.init_process_group(backend, rank=rank, world_size=world_size)
         # try:
-        fn(rank, world_size)
+        # fn(rank, world_size)
         # except Exception as e:
         #     print(f"Error: {e}")
         #     dist.destroy_process_group()
@@ -166,17 +174,17 @@ if __name__ == "__main__":
     # if cuda:
     #     init_process(fn=run, backend="nccl", cuda=True)
     # else:
-    #     world_size = 2
-    #     processes = []
+    world_size = 2
+    processes = []
 
-    #     mp.set_start_method("spawn")
+    mp.set_start_method("spawn")
 
-    #     for rank in range(world_size):
-    #         process = mp.Process(target=init_process, args=(rank, world_size, run))
-    #         process.start()
-    #         processes.append(process)
+    for rank in range(world_size):
+        process = mp.Process(target=init_process, args=(rank, world_size, run))
+        process.start()
+        processes.append(process)
 
-    #     for p in processes:
-    #         p.join()
+    for p in processes:
+        p.join()
 
     main()
