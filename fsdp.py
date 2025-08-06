@@ -59,9 +59,8 @@ class FSDP(nn.Module):
         super().__init__()
         self.module = module
 
+    def _init_param_from_module(self):
         # init process group -> we'll pass the list pd
-
-    def _init_param_from_module():
         # check where module is initialized
         # materialize module if needed
         # get modules to materialize;
@@ -70,6 +69,29 @@ class FSDP(nn.Module):
         # sync module states
         # using flatparamhandle to flatten params
         # handle.shard
+        pass
+
+    def forward(self):
+        # root_pre_forward
+        #   - set handles forward prefetch
+        #   - set unshard stream for all gather and pre unshard stream for prefetch should wait for computation stream for optimization step
+        #   - reset grad for flat params. if we use_orig_params, then .zero_grad clears orig_params grads which is just a view of unsharded flat param grad, and after resharding we'll dangling references into the unsharded flat params
+        # pre_forward
+        #   - If we are backward prefetching return; why?
+        #   - record preforward in execution order object
+        #   - set training state to forward
+        #   - call unshard fn, ideally this should be the allgather operation
+        #   - register post backward hook for reduce scatter and resharding
+        #   - reallocate the _cpu_grad if optimizer overlap set the grad to None in the backward pass. why?
+        #   - register_post_backward_reshard_only_hook, what's the difference with register post backward hook
+        # call modules forward computation
+        # post_forward
+        #   - If we are in the baclward prefetching return
+        #   - record post forward in execution order object
+        #   - call reshard fn
+        #   - register pre backward hook, why here and not in pre_forward?
+        #   - set training state to idle, why?
+
         pass
 
     def print_module(self):
