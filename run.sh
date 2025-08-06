@@ -1,0 +1,1 @@
+torchrun --nnodes=1 fsdp.py

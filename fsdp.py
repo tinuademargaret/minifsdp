@@ -63,9 +63,9 @@ class FSDP(nn.Module):
         # get default group created by init_process_group
         self.process_group = _get_default_group()
         self.rank = self.process_group.rank()
-        self.world_size = self.process_group.world_size()
+        self.world_size = self.process_group.size()
 
-        self.__init_param_from_module()
+        self._init_param_from_module()
 
     def _init_param_from_module(self):
 
@@ -118,7 +118,7 @@ def run(rank, world_size, device=None):
     assert rank == dist.get_rank()
     assert world_size == dist.get_world_size()
 
-    with torch.devic("meta"):
+    with torch.device("meta"):
         model = MLP()
     fsdp_model = FSDP(model)
     optimizer = torch.optim.SGD(model.parameters())
@@ -153,38 +153,38 @@ def run(rank, world_size, device=None):
 def init_process(rank=None, world_size=None, fn=None, backend="gloo", cuda=False):
     if cuda:
         dist.init_process_group(backend=backend)
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
         device = f"cuda:{rank}"
-        fn(rank, world_size, device)
+        # fn(rank, world_size, device)
     else:
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "12340"
         os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
         dist.init_process_group(backend, rank=rank, world_size=world_size)
-        # try:
-        # fn(rank, world_size)
-        # except Exception as e:
-        #     print(f"Error: {e}")
-        #     dist.destroy_process_group()
+        try:
+            fn(rank, world_size)
+        except Exception as e:
+            print(f"Error: {e}")
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
-    # cuda = torch.cuda.is_available()
-    # if cuda:
-    #     init_process(fn=run, backend="nccl", cuda=True)
-    # else:
-    world_size = 2
-    processes = []
+    cuda = torch.cuda.is_available()
+    if cuda:
+        init_process(fn=run, backend="nccl", cuda=True)
+    else:
+        world_size = 2
+        processes = []
 
-    mp.set_start_method("spawn")
+        mp.set_start_method("spawn")
 
-    for rank in range(world_size):
-        process = mp.Process(target=init_process, args=(rank, world_size, run))
-        process.start()
-        processes.append(process)
+        for rank in range(world_size):
+            process = mp.Process(target=init_process, args=(rank, world_size, run))
+            process.start()
+            processes.append(process)
 
-    for p in processes:
-        p.join()
+        for p in processes:
+            p.join()
 
     main()
