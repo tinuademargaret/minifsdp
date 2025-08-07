@@ -10,6 +10,8 @@ from torch.distributed.distributed_c10d import _get_default_group
 from utils import get_orig_params
 from model import MLP, DataloaderLite, generate_dataset
 
+PARAM_BROADCAST_BUCKET_SIZE = int(250 * 1024 * 1024)
+
 
 class FlatParameter(nn.Parameter):
 
@@ -48,7 +50,13 @@ class FlatParameterHandle:
 
 class FSDP(nn.Module):
 
-    def __init__(self, module: nn.Module, use_orig_params=False, device_id=None):
+    def __init__(
+        self,
+        module: nn.Module,
+        use_orig_params=False,
+        device_id=None,
+        sync_module_states=False,
+    ):
         """
         split module into units, 1 layer -> 1 unit, map?
         convert each unit into a flat parameter
@@ -57,6 +65,7 @@ class FSDP(nn.Module):
         Note: full sharding only
         Note:  the splitting into FSDP “units” that the paper talks about is exactly what auto_wrap_policy (and related wrapping logic) controls in the PyTorch codebase,
         when auto_wrap_policy is not given, FSDP often just wraps one module at a time in a layer-by-layer fashion
+        Note: no support for traceable_wrapper_subclass tensors e.g QuantizedTensor
         """
         super().__init__()
         self.module = module
@@ -73,23 +82,45 @@ class FSDP(nn.Module):
         self._fully_sharded_module_to_handle = {}
         self._handle = None
         self.params = []
+        self.sync_module_states = sync_module_states
+
+        # split module into units
 
         self._init_param_from_module()
 
+    # this function would handle the materialization and sharding of each unit
     def _init_param_from_module(self):
         # check that all modules are initialized on the same device
         # check where module is initialized, meta, cpu, or gpu
-        is_meta = any(param.device.type == "meta" for param in get_orig_params(self.module))
-        print(is_meta)
+        # Actually what I want to do here is to materialize a layer then shard it immediately. normally this is achieved via the auto_wrap_policy in pytorch, when there is no auto_wrap_policy the entire module is treated as a unit.
+        params = get_orig_params(self.module)
+        if len(params) == 0:
+            raise ValueError("Module has no parameters")
+
+        is_meta = any(param.device.type == "meta" for param in params)
 
         if is_meta:
             # materialize module if needed
             self.materialize_meta_module()
 
-        device = {param.device.type for param in get_orig_params(self.module)}
+        device = {param.device.type for param in params}
         assert len(device) == 1
 
-        #  - sync module states
+        # sync module states, so that all processes have the same module states, has some communication overhead, perform ablations on this, overhead vs accuracy
+        if self.sync_module_states:
+            module_states = []
+            for param in params:
+                # create a view of the param
+                detached_param = param.detach()
+                module_states.append(detached_param)
+            # broadcast params to all processes in buckets of size PARAM_BROADCAST_BUCKET_SIZE, modifies tensors in place
+            dist._broadcast_coalesced(
+                self.process_group,
+                module_states,
+                src=0,
+                bucket_size_bytes=PARAM_BROADCAST_BUCKET_SIZE,
+            )
+
         # using flatparamhandle
         #   - flatten params
         #   - handle.shard
