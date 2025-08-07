@@ -79,15 +79,15 @@ class FSDP(nn.Module):
     def _init_param_from_module(self):
         # check that all modules are initialized on the same device
         # check where module is initialized, meta, cpu, or gpu
-        is_meta = any(param.device == "meta" for param in get_orig_params(self.module))
+        is_meta = any(param.device.type == "meta" for param in get_orig_params(self.module))
+        print(is_meta)
 
         if is_meta:
             # materialize module if needed
             self.materialize_meta_module()
 
-        device = {param.device for param in get_orig_params(self.module)}
+        device = {param.device.type for param in get_orig_params(self.module)}
         assert len(device) == 1
-        assert device == self.device_id
 
         #  - sync module states
         # using flatparamhandle
@@ -105,9 +105,9 @@ class FSDP(nn.Module):
             with torch.no_grad():
                 for module in modules_to_materialize:
                     module_state_iter = itertools.chain(
-                        module.parameters(recurse=False), module.bufers(recurse=False)
+                        module.parameters(recurse=False), module.buffers(recurse=False)
                     )
-                    has_module_states = len(list(module_state_iter) > 0)
+                    has_module_states = len(list(module_state_iter)) > 0
                     # skips modules with no activation function
                     if has_module_states:
                         module.to_empty(device=materialization_device, recurse=False)
