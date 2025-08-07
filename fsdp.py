@@ -1,5 +1,7 @@
 import os
 import itertools
+from typing import NamedTuple
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -7,22 +9,95 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.distributed_c10d import _get_default_group
 
-from utils import get_orig_params
+from utils import (
+    get_orig_params,
+    _get_aligned_numel,
+    _construct_padding_tensor,
+    _is_truly_contiguous,
+    _detach_if_needed,
+    _convert_to_params,
+)
 from model import MLP, DataloaderLite, generate_dataset
 
 PARAM_BROADCAST_BUCKET_SIZE = int(250 * 1024 * 1024)
 
 
+class ParamInfo(NamedTuple):
+    """Information for an original parameter."""
+
+    param_name: str  # unprefixed
+    module: nn.Module
+    module_name: str
+
+
 class FlatParameter(nn.Parameter):
+    """
+    store initial shapes of each param in a unit, map?
+    then convert to 1d tensor with actual storage
+    Note: we'll also ignore initialization methods e.g xavier initialization for the params
+    """
 
-    def __init__(self):
-        """
-        store initial shapes of each param in a unit, map?
-        then convert to 1d tensor with actual storage
-        Note: we'll also ignore initialization methods e.g xavier initialization for the params
-        """
+    # flat parameter is not a subclass of nn.Parameter, instead it creates a new nn.Parameter object with a new attribute _is_flat_param
+    def __new__(cls, data=None, requires_grad=True):
+        assert cls is FlatParameter, "subclasses FlatParameter not supported"
+        r = nn.Parameter.__new__(nn.Parameter, data, requires_grad)
+        r._is_flat_param = True
+        return r
 
-        pass
+    @classmethod
+    def __init_metadata(
+        cls,
+        self,
+        param_infos,
+        numels,
+        shapes,
+        strides,
+        contiguities,
+        fqns,
+        params,
+        is_padding_mask,
+    ):
+
+        # manually initialize attributes of FlatParameter
+        assert len(param_infos) == len(shapes)
+        assert len(param_infos) == len(strides)
+        assert len(param_infos) == len(contiguities)
+        assert len(param_infos) == len(fqns)
+        self._num_params = len(param_infos)
+        self._param_infos = param_infos
+        self._shapes = shapes
+        self._strides = strides
+        self._contiguities = contiguities
+        self._fqns = fqns
+        self._is_padding_mask = is_padding_mask
+
+        numels_without_padding: list[int] = []
+        # Improvement: we can use an array to store numels and use boolean index with is_padding_mask to get the numels without padding
+        for numel, is_padding in zip(numels, is_padding_mask):
+            if not is_padding:
+                numels_without_padding.append(numel)
+        self._numels = tuple(numels_without_padding)
+        self._numels_with_padding = tuple(numels)
+        assert len(self._numels) == self._num_params
+
+        self._modules = {pi.module for pi in self._param_infos}
+
+        if params is not None:
+            self._params = []
+            for param, is_padding in zip(params, is_padding_mask):
+                if not is_padding:
+                    self._params.append(param)
+
+            self._is_grad_none_mask = [False for _ in range(self._num_params)]
+            self._tensors = [None for _ in range(self._num_params)]
+        else:
+            self._params = None
+            self._is_grad_none_mask = None
+            self._tensors = None
+        self._unpadded_unsharded_size = self.size()
+        # Tracks whether the `FlatParameter`'s post-backward hook has been
+        # called to modify the behavior of the post-backward callback
+        self._post_backward_called = False
 
 
 class FlatParameterHandle:
@@ -30,19 +105,156 @@ class FlatParameterHandle:
     handles a viewing and sharding of a flat parameter
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        params,
+        fully_sharded_module,
+        device,
+        process_group,
+        use_orig_params,
+    ):
+        self.device = device
+        self.process_group = process_group
+        self.use_orig_params = use_orig_params
+        self._fully_sharded_module = fully_sharded_module
+        self.param_dtype = params[0].dtype
+        self.params = params
+
+        align_addresses = use_orig_params
         # get aligned number
+        self._aligned_numel = (
+            _get_aligned_numel(self.param_dtype) if align_addresses else 0
+        )
+
         # Initialize flat parameter and metadata
-        pass
+        self._init_flat_param_metadata()
 
-    def get_aligned_number(self):
-        pass
+    def _init_flat_param_metadata(self, module, aligned_numel):
 
+        if self._aligned_numel < 0:
+            raise ValueError(
+                f"Invalid aligned number: {self._aligned_numel} for dtype: {self.param_dtype}"
+            )
+
+        param_dtype, param_requires_grad, param_device = self.validate_tensors()
+
+        param_set = set(self.params)
+        param_infos = []
+        numels = []
+        shapes = []
+        strides = []
+        contiguities = []
+        fqns = []
+        params_to_flatten = []
+        is_padding_mask = []
+        total_numel = total_numel_without_padding = 0
+
+        for module_name, module in module.named_modules():
+            for param_name, param in module.named_parameters(recurse=False):
+                if param not in param_set:
+                    continue
+                if aligned_numel > 0:
+                    # (total_numel % aligned_numel) how many elements are left after fitting all the elements in batches of aligned_numel
+                    # numel_to_pad is then the number of elements needed to pad the remaining elements to be up to aligned_numel
+                    numel_to_pad = aligned_numel - (total_numel % aligned_numel)
+                    padding_tensor = _construct_padding_tensor(
+                        numel_to_pad, param_dtype, False, param_device
+                    )
+                    params_to_flatten.append(padding_tensor)
+                    is_padding_mask.append(True)
+                    numels.append(numel_to_pad)
+                    total_numel += numel_to_pad
+                params_to_flatten.append(param)
+                is_padding_mask.append(False)
+                param_infos.append(ParamInfo(param_name, module, module_name))
+                numels.append(param.numel())
+                shapes.append(param.shape)
+                strides.append(param.stride())
+                contiguities.append(_is_truly_contiguous(param))
+                fqn = module_name + "." + param_name if module_name else param_name
+                fqns.append(fqn)
+                total_numel += param.numel()
+                total_numel_without_padding += param.numel()
+        if len(params_to_flatten) == 0:
+            raise ValueError(
+                f"`params` were not found in `module`'s tree"
+                f"params: {self.params}\nmodule: {module}"
+            )
+        if aligned_numel > 0:
+            # Pad to be divisible by world size to avoid a copy for the
+            # post-backward reduce-scatter
+            numel_to_pad = self.world_size - (total_numel % self.world_size)
+            if numel_to_pad > 0 and numel_to_pad < self.world_size:
+                padding_tensor = _construct_padding_tensor(
+                    numel_to_pad, param_dtype, False, param_device
+                )
+                params_to_flatten.append(padding_tensor)
+                is_padding_mask.append(True)
+                numels.append(numel_to_pad)
+                total_numel += numel_to_pad
+        self.flat_param = self.flatten_tensors(params_to_flatten, param_requires_grad)
+        FlatParameter._init_metadata(
+            self.flat_param,
+            param_infos,
+            numels,
+            shapes,
+            strides,
+            contiguities,
+            fqns,
+            _convert_to_params(params_to_flatten) if self.use_orig_params else None,
+            is_padding_mask,
+        )
+
+    # this basically means that when you are splitting a module into units one consideration you have to make is that parameters in a unit have the same dtype, device and requires_grad
     def validate_tensors(self):
-        pass
+        param_dtype = None
+        param_requires_grad = None
+        param_device = None
 
-    def flatten_tensors(self):
-        pass
+        for param in self.params:
+            if isinstance(param, FlatParameter):
+                raise ValueError("Cannot flatten a `FlatParameter`")
+            if param_dtype is None and not param.is_floating_point():
+                raise ValueError("Cannot flatten integer dtype tensors")
+            if param_dtype is not None and param.dtype != param_dtype:
+                raise ValueError(
+                    f"Must flatten tensors with uniform dtype but got {param_dtype} "
+                    f"and {param.dtype}"
+                )
+            if (
+                not self._use_orig_params
+                and param_requires_grad is not None
+                and param.requires_grad != param_requires_grad
+            ):
+                raise ValueError(
+                    "Must flatten tensors with uniform `requires_grad` when "
+                    "`use_orig_params=False`"
+                )
+            if param_device is not None and param.device != param_device:
+                raise ValueError(
+                    "Must flatten tensors on the same device but got both "
+                    f"{param_device} and {param.device}"
+                )
+            dtype = param.dtype
+            param_requires_grad = param_requires_grad or param.requires_grad
+            device = param.device
+        assert param_requires_grad is not None, "Requires non-empty `tensors` list"
+        return dtype, param_requires_grad, device
+
+    def flatten_tensors(self, params_to_flatten, requires_grad):
+        flat_tensors = torch.cat(
+            [
+                (
+                    torch.flatten(_detach_if_needed(tensor))
+                    if _is_truly_contiguous(tensor)
+                    else _detach_if_needed(tensor).as_strided((tensor.numel(),), (1,))
+                )
+                for tensor in params_to_flatten
+            ],
+            dim=0,
+        )
+
+        return FlatParameter(flat_tensors, requires_grad=requires_grad)
 
     def shard(self):
         pass
@@ -66,6 +278,8 @@ class FSDP(nn.Module):
         Note:  the splitting into FSDP “units” that the paper talks about is exactly what auto_wrap_policy (and related wrapping logic) controls in the PyTorch codebase,
         when auto_wrap_policy is not given, FSDP often just wraps one module at a time in a layer-by-layer fashion
         Note: no support for traceable_wrapper_subclass tensors e.g QuantizedTensor
+        Note: no mixed precision support
+        NOte: no support for shared params
         """
         super().__init__()
         self.module = module
