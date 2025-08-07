@@ -1,4 +1,5 @@
 import os
+import itertools
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -6,13 +7,13 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.distributed_c10d import _get_default_group
 
-
+from utils import get_orig_params
 from model import MLP, DataloaderLite, generate_dataset
 
 
 class FlatParameter(nn.Parameter):
 
-    def __init__(self, unit):
+    def __init__(self):
         """
         store initial shapes of each param in a unit, map?
         then convert to 1d tensor with actual storage
@@ -47,7 +48,7 @@ class FlatParameterHandle:
 
 class FSDP(nn.Module):
 
-    def __init__(self, module: nn.Module):
+    def __init__(self, module: nn.Module, use_orig_params=False, device_id=None):
         """
         split module into units, 1 layer -> 1 unit, map?
         convert each unit into a flat parameter
@@ -59,25 +60,60 @@ class FSDP(nn.Module):
         """
         super().__init__()
         self.module = module
+        self.device_id = device_id
 
         # get default group created by init_process_group
         self.process_group = _get_default_group()
         self.rank = self.process_group.rank()
         self.world_size = self.process_group.size()
+        self.use_orig_params = use_orig_params
+        self.training_state = "Idle"
+        self.is_root = None
+        self._exec_order_data = None
+        self._fully_sharded_module_to_handle = {}
+        self._handle = None
+        self.params = []
 
         self._init_param_from_module()
 
     def _init_param_from_module(self):
+        # check that all modules are initialized on the same device
+        # check where module is initialized, meta, cpu, or gpu
+        is_meta = any(param.device == "meta" for param in get_orig_params(self.module))
 
-        # check where module is initialized
-        # materialize module if needed
-        # get modules to materialize;
-        # get device to materialize on
-        # in no_grad context, for each module, move module to device and reset_parameters
-        # sync module states
-        # using flatparamhandle to flatten params
-        # handle.shard
+        if is_meta:
+            # materialize module if needed
+            self.materialize_meta_module()
+
+        device = {param.device for param in get_orig_params(self.module)}
+        assert len(device) == 1
+        assert device == self.device_id
+
+        #  - sync module states
+        # using flatparamhandle
+        #   - flatten params
+        #   - handle.shard
         print(f"Hello in FSDP from rank {self.rank} of {self.world_size}")
+
+    def materialize_meta_module(self):
+        #   - get device to materialize on
+        materialization_device = self.device_id
+        #   - get modules to materialize; we do not focus on using nested submodules in our model for demonstration
+        modules_to_materialize = list(self.module.modules())
+        try:
+            #   - in no_grad context, for each module, move module to device and reset_parameters
+            with torch.no_grad():
+                for module in modules_to_materialize:
+                    module_state_iter = itertools.chain(
+                        module.parameters(recurse=False), module.bufers(recurse=False)
+                    )
+                    has_module_states = len(list(module_state_iter) > 0)
+                    # skips modules with no activation function
+                    if has_module_states:
+                        module.to_empty(device=materialization_device, recurse=False)
+                        module.reset_parameters()
+        except Exception as e:
+            raise e
 
     def forward(self):
         # root_pre_forward
@@ -107,9 +143,9 @@ class FSDP(nn.Module):
             print(idx, "->", m)
 
 
-def main():
+def main(device_id):
     module = MLP().to(device="meta")
-    fsdp_model = FSDP(module)
+    fsdp_model = FSDP(module, device_id=device_id)
     fsdp_model.print_module()
 
 
@@ -157,6 +193,7 @@ def init_process(rank=None, world_size=None, fn=None, backend="gloo", cuda=False
         world_size = dist.get_world_size()
         device = f"cuda:{rank}"
         # fn(rank, world_size, device)
+        main(device)
     else:
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "12340"
@@ -186,5 +223,3 @@ if __name__ == "__main__":
 
         for p in processes:
             p.join()
-
-    main()
