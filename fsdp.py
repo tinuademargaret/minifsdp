@@ -18,6 +18,7 @@ from utils import (
     _detach_if_needed,
     _convert_to_params,
     is_param_sync,
+    is_flattened,
 )
 from model import MLP, DataloaderLite, generate_dataset
 
@@ -142,11 +143,10 @@ class FlatParameterHandle:
 
         align_addresses = use_orig_params
         # get aligned number
-        self._aligned_numel = (
-            _get_aligned_numel(self.param_dtype) if align_addresses else 0
-        )
+        # in pytorch they only use this when using orig params but alignment could still be beneficial for GPU computation efficiency even without original parameters
+        self._aligned_numel = _get_aligned_numel(self.param_dtype)
 
-        # Initialize flat parameter and metadata
+        # Initialize flat parameter and it's metadata
         self._init_flat_param_metadata(self._fully_sharded_module, self._aligned_numel)
 
     def _init_flat_param_metadata(self, module, aligned_numel):
@@ -159,31 +159,34 @@ class FlatParameterHandle:
         param_dtype, param_requires_grad, param_device = self.validate_tensors()
 
         param_set = set(self.params)
-        param_infos = []
-        numels = []
-        shapes = []
-        strides = []
-        contiguities = []
-        fqns = []
-        params_to_flatten = []
-        is_padding_mask = []
+        param_infos: list[ParamInfo] = []
+        numels: list[int] = []
+        shapes: list[torch.Size] = []
+        strides: list[tuple[int, ...]] = []
+        contiguities: list[bool] = []
+        fqns: list[str] = []
+        params_to_flatten: list[torch.Tensor] = []
+        is_padding_mask: list[bool] = []
         total_numel = total_numel_without_padding = 0
 
+        # since i'm not using nested modules, can I just get the module name and module object using module.named_modules()[0] or some other method instead of having this outer loop?
+        # e.g nn.Linear(in_features, out_features, bias=True)
+        # nn.Linear.weight and nn.Linear.bias are the parameters
         for module_name, module in module.named_modules():
             for param_name, param in module.named_parameters(recurse=False):
-                if param not in param_set:
-                    continue
                 if aligned_numel > 0:
                     # (total_numel % aligned_numel) how many elements are left after fitting all the elements in batches of aligned_numel
                     # numel_to_pad is then the number of elements needed to pad the remaining elements to be up to aligned_numel
+                    # in the first iteration, total_numel is 0 so numel_to_pad is aligned_numel
                     numel_to_pad = aligned_numel - (total_numel % aligned_numel)
-                    padding_tensor = _construct_padding_tensor(
-                        numel_to_pad, param_dtype, False, param_device
-                    )
-                    params_to_flatten.append(padding_tensor)
-                    is_padding_mask.append(True)
-                    numels.append(numel_to_pad)
-                    total_numel += numel_to_pad
+                    if numel_to_pad > 0 and numel_to_pad < aligned_numel:
+                        padding_tensor = _construct_padding_tensor(
+                            numel_to_pad, param_dtype, False, param_device
+                        )
+                        params_to_flatten.append(padding_tensor)
+                        is_padding_mask.append(True)
+                        numels.append(numel_to_pad)
+                        total_numel += numel_to_pad
                 params_to_flatten.append(param)
                 is_padding_mask.append(False)
                 param_infos.append(ParamInfo(param_name, module, module_name))
@@ -212,7 +215,9 @@ class FlatParameterHandle:
                 is_padding_mask.append(True)
                 numels.append(numel_to_pad)
                 total_numel += numel_to_pad
-        self.flat_param = self.flatten_tensors(params_to_flatten, param_requires_grad)
+        self.flat_param: FlatParameter = self.flatten_tensors(
+            params_to_flatten, param_requires_grad
+        )
         FlatParameter._init_metadata_(
             self.flat_param,
             param_infos,
@@ -224,6 +229,10 @@ class FlatParameterHandle:
             _convert_to_params(params_to_flatten) if self.use_orig_params else None,
             is_padding_mask,
         )
+
+        assert is_flattened(
+            self.params, self.flat_param._params
+        ), "Params are not flattened"
 
     # this basically means that when you are splitting a module into units one consideration you have to make is that parameters in a unit have the same dtype, device and requires_grad
     def validate_tensors(self):
@@ -298,7 +307,7 @@ class FlatParameterHandle:
         allocated = flat_param._typed_storage()._size() > 0
         if allocated:
             flat_param._typed_storage()._resize_(0)
-        flat_param.set_(shard)  # type: ignore[call-overload]
+        flat_param.set_(shard)
         start_idx = shard.numel() * self.rank
         end_idx = shard.numel() * (self.rank + 1) - 1
         self._init_shard_metadata(start_idx, end_idx)
@@ -306,8 +315,9 @@ class FlatParameterHandle:
             self._use_sharded_views()
 
     def _init_shard_metadata(self, start_idx, end_idx):
+        # self.flat_param should now contain the shard for this rank
         flat_param = self.flat_param
-        flat_param._sharded_size = flat_param.size()  # type: ignore[attr-defined]
+        flat_param._sharded_size = flat_param.size()
 
         assert (
             start_idx >= 0 and start_idx <= end_idx
@@ -337,8 +347,7 @@ class FlatParameterHandle:
         ), f"Expected {len(self.flat_param._numels_with_padding)} but got {len(flat_param_offsets)}"
         shard_param_infos = []
         sharded_flat_param_numel = unsharded_end_idx - unsharded_start_idx + 1
-        # `unsharded_param_start_idx` and `unsharded_param_end_idx` are indices
-        # into the unsharded flat parameter (inclusive) of the given parameter
+
         for (
             (unsharded_param_start_idx, unsharded_param_end_idx),
             is_padding,
@@ -384,6 +393,8 @@ class FlatParameterHandle:
         return tuple(shard_param_infos)
 
     def _get_flat_param_offsets(self) -> list[tuple[int, int]]:
+        # accumulate returns an iterator that yields running sums of the input sequence
+        # e.g. [1,2,3,4] -> [1, 1+2, 1+2+3, 1+2+3+4] -> [1,3,6,10]
         cumulative_sum = list(accumulate(self.flat_param._numels_with_padding))
         starts = [0] + cumulative_sum[:-1]
         ends = [end - 1 for end in cumulative_sum]  # inclusive
@@ -421,17 +432,9 @@ class FlatParameterHandle:
                 offset = shard_param_info.offset_in_shard
                 numel_in_shard = shard_param_info.numel_in_shard
                 param.data = flat_param[offset : offset + numel_in_shard]
-        assert self.flat_param._shared_params is not None
-        for i, (
-            param,
-            (param_name, module, _, prim_param_name, prim_module, _),
-        ) in enumerate(
-            zip(self.flat_param._shared_params, self.flat_param._shared_param_infos)
-        ):
-            self._setattr_param(module, param_name, param)
-            prim_param = getattr(prim_module, prim_param_name)
-            param.data = prim_param  # could be both empty and non-empty
-        if self._training_state == HandleTrainingState.BACKWARD_POST:
+
+        # we've not implemented saving tensors yet
+        if self._training_state == "backward_post":
             # Clear the saved `Tensor`s since they are unneeded now
             for i in range(len(self.flat_param._tensors)):
                 self.flat_param._tensors[i] = None
@@ -484,6 +487,8 @@ class FSDP(nn.Module):
         # check that all modules are initialized on the same device
         # check where module is initialized, meta, cpu, or gpu
         # Actually what I want to do here is to materialize a layer then shard it immediately. normally this is achieved via the auto_wrap_policy in pytorch, when there is no auto_wrap_policy the entire module is treated as a unit.
+
+        # I will change this to use the module.named_parameters() if it turns out there are no additional fn in get_orig_params
         params = get_orig_params(self.module)
         if len(params) == 0:
             raise ValueError("Module has no parameters")

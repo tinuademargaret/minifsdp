@@ -79,3 +79,10 @@ def is_param_sync(model: torch.nn.Module, rank: int):
             if not torch.allclose(gathered[0], gathered[i]):
                 return False
     return True
+
+
+def is_flattened(params, flat_param):
+    for param in params:
+        if param not in flat_param:
+            return False
+    return True
