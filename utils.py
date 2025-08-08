@@ -81,8 +81,10 @@ def is_param_sync(model: torch.nn.Module, rank: int):
     return True
 
 
-def is_flattened(params, flat_param):
-    for param in params:
+def is_flattened(params, flat_param, is_padding_mask):
+    for param, is_padding in zip(params, is_padding_mask):
+        if is_padding:
+            continue
         if param not in flat_param:
             return False
     return True

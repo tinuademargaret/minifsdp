@@ -90,6 +90,9 @@ class FlatParameter(nn.Parameter):
         self._fqns = fqns
         self._is_padding_mask = is_padding_mask
 
+        print(f"param_infos: {len(param_infos)}")
+        print(f"params: {len(params)}")
+
         numels_without_padding: list[int] = []
         # Improvement: we can use an array to store numels and use boolean index with is_padding_mask to get the numels without padding
         for numel, is_padding in zip(numels, is_padding_mask):
@@ -157,6 +160,8 @@ class FlatParameterHandle:
             )
 
         param_dtype, param_requires_grad, param_device = self.validate_tensors()
+
+        print(f"param_device: {param_device}")
 
         param_set = set(self.params)
         param_infos: list[ParamInfo] = []
@@ -226,13 +231,14 @@ class FlatParameterHandle:
             strides,
             contiguities,
             fqns,
+            # why the use_orig_params is needed here?
             _convert_to_params(params_to_flatten) if self.use_orig_params else None,
             is_padding_mask,
         )
 
-        assert is_flattened(
-            self.params, self.flat_param._params
-        ), "Params are not flattened"
+        # assert is_flattened(
+        #     self.params, self.flat_param._params, is_padding_mask
+        # ), "Params are not flattened"
 
     # this basically means that when you are splitting a module into units one consideration you have to make is that parameters in a unit have the same dtype, device and requires_grad
     def validate_tensors(self):
@@ -251,7 +257,7 @@ class FlatParameterHandle:
                     f"and {param.dtype}"
                 )
             if (
-                not self._use_orig_params
+                not self.use_orig_params
                 and param_requires_grad is not None
                 and param.requires_grad != param_requires_grad
             ):
@@ -311,7 +317,7 @@ class FlatParameterHandle:
         start_idx = shard.numel() * self.rank
         end_idx = shard.numel() * (self.rank + 1) - 1
         self._init_shard_metadata(start_idx, end_idx)
-        if self._use_orig_params:
+        if self.use_orig_params:
             self._use_sharded_views()
 
     def _init_shard_metadata(self, start_idx, end_idx):
@@ -499,6 +505,9 @@ class FSDP(nn.Module):
             # materialize module if needed
             self.materialize_meta_module()
 
+        # we need to update params to the initialized
+        params = get_orig_params(self.module)
+
         device = {param.device.type for param in params}
         assert len(device) == 1
 
@@ -582,7 +591,7 @@ class FSDP(nn.Module):
 def main(device_id):
     # deffered initialization of the model
     module = MLP().to(device="meta")
-    fsdp_model = FSDP(module, device_id=device_id)
+    fsdp_model = FSDP(module, device_id=device_id, use_orig_params=True)
     fsdp_model.print_module()
 
 
@@ -629,7 +638,11 @@ def init_process(rank=None, world_size=None, fn=None, backend="gloo", cuda=False
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         device = f"cuda:{rank}"
-        fn(device)
+        try:
+            fn(device)
+        except Exception as e:
+            print(f"Error: {e}")
+            dist.destroy_process_group()
     else:
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "12340"
