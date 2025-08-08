@@ -17,6 +17,7 @@ from utils import (
     _is_truly_contiguous,
     _detach_if_needed,
     _convert_to_params,
+    is_param_sync,
 )
 from model import MLP, DataloaderLite, generate_dataset
 
@@ -510,6 +511,7 @@ class FSDP(nn.Module):
                 src=0,
                 bucket_size_bytes=PARAM_BROADCAST_BUCKET_SIZE,
             )
+            assert is_param_sync(self.module, self.rank), "Parameters are not synced"
 
         # using flatparamhandle
         #   - flatten params
@@ -573,6 +575,7 @@ class FSDP(nn.Module):
 
 
 def main(device_id):
+    # deffered initialization of the model
     module = MLP().to(device="meta")
     fsdp_model = FSDP(module, device_id=device_id)
     fsdp_model.print_module()
@@ -621,8 +624,7 @@ def init_process(rank=None, world_size=None, fn=None, backend="gloo", cuda=False
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         device = f"cuda:{rank}"
-        # fn(rank, world_size, device)
-        main(device)
+        fn(device)
     else:
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "12340"
@@ -638,7 +640,7 @@ def init_process(rank=None, world_size=None, fn=None, backend="gloo", cuda=False
 if __name__ == "__main__":
     cuda = torch.cuda.is_available()
     if cuda:
-        init_process(fn=run, backend="nccl", cuda=True)
+        init_process(fn=main, backend="nccl", cuda=True)
     else:
         world_size = 2
         processes = []

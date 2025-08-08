@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from typing import Union
 import functools
+import torch.distributed as dist
 
 _FLAT_PARAM_PADDING_VALUE = 42
 
@@ -59,3 +60,22 @@ def _convert_to_params(
     tensors: list[Union[torch.Tensor, nn.Parameter]],
 ) -> list[nn.Parameter]:
     return [t if isinstance(t, nn.Parameter) else nn.Parameter(t) for t in tensors]
+
+
+def is_param_sync(model: torch.nn.Module, rank: int):
+    """Check that all parameters are synced across ranks."""
+    # Each rank computes a list of parameter sums
+    param = next(model.parameters())
+    param_sum = torch.tensor(param.data.float().sum().item(), device="cuda")
+
+    # Gather all param_summaries from all ranks
+    world_size = dist.get_world_size()
+    gathered = [torch.zeros_like(param_sum) for _ in range(world_size)]
+    dist.all_gather(gathered, param_sum)
+
+    # On rank 0, compare all gathered summaries
+    if rank == 0:
+        for i in range(1, world_size):
+            if not torch.allclose(gathered[0], gathered[i]):
+                return False
+    return True
