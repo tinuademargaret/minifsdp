@@ -144,6 +144,8 @@ class FlatParameterHandle:
         self.rank = process_group.rank()
         self.world_size = process_group.size()
 
+        self._training_state = "idle"
+
         align_addresses = use_orig_params
         # get aligned number
         # in pytorch they only use this when using orig params but alignment could still be beneficial for GPU computation efficiency even without original parameters
@@ -151,6 +153,12 @@ class FlatParameterHandle:
 
         # Initialize flat parameter and it's metadata
         self._init_flat_param_metadata(self._fully_sharded_module, self._aligned_numel)
+
+    def _setattr_param(self, module, param_name, param):
+        if hasattr(module, param_name):
+            delattr(module, param_name)
+        setattr(module, param_name, param)
+
 
     def _init_flat_param_metadata(self, module, aligned_numel):
 
@@ -291,6 +299,7 @@ class FlatParameterHandle:
 
         return FlatParameter(flat_tensors, requires_grad=requires_grad)
 
+    @torch.no_grad()
     def shard(self):
         flat_param = self.flat_param
         rank = self.rank
@@ -334,8 +343,7 @@ class FlatParameterHandle:
             len(shard_param_infos) == flat_param._num_params
         ), f"Expects length {flat_param._num_params} but got {len(shard_param_infos)}"
         flat_param._shard_param_infos = shard_param_infos  # type: ignore[attr-defined]
-        flat_param._shard_numel_padded = numel_padded  # type: ignore[attr-defined]
-
+       
     def _get_shard_metadata(
         self,
         unsharded_start_idx: int,
@@ -638,11 +646,11 @@ def init_process(rank=None, world_size=None, fn=None, backend="gloo", cuda=False
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         device = f"cuda:{rank}"
-        try:
-            fn(device)
-        except Exception as e:
-            print(f"Error: {e}")
-            dist.destroy_process_group()
+        # try:
+        fn(device)
+        # except Exception as e:
+        #     print(f"Error: {e}")
+        #     dist.destroy_process_group()
     else:
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "12340"
