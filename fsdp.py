@@ -159,7 +159,6 @@ class FlatParameterHandle:
             delattr(module, param_name)
         setattr(module, param_name, param)
 
-
     def _init_flat_param_metadata(self, module, aligned_numel):
 
         if self._aligned_numel < 0:
@@ -343,7 +342,7 @@ class FlatParameterHandle:
             len(shard_param_infos) == flat_param._num_params
         ), f"Expects length {flat_param._num_params} but got {len(shard_param_infos)}"
         flat_param._shard_param_infos = shard_param_infos  # type: ignore[attr-defined]
-       
+
     def _get_shard_metadata(
         self,
         unsharded_start_idx: int,
@@ -473,7 +472,8 @@ class FSDP(nn.Module):
         when auto_wrap_policy is not given, FSDP often just wraps one module at a time in a layer-by-layer fashion
         Note: no support for traceable_wrapper_subclass tensors e.g QuantizedTensor
         Note: no mixed precision support
-        NOte: no support for shared params
+        Note: no support for shared params
+        Note: no cpu offloading
         """
         super().__init__()
         self.module = module
@@ -495,6 +495,8 @@ class FSDP(nn.Module):
         # split module into units
 
         self._init_param_from_module()
+
+        self._fsdp_wrapped_module = module
 
     # this function would handle the materialization and sharding of each unit
     def _init_param_from_module(self):
@@ -535,9 +537,6 @@ class FSDP(nn.Module):
             )
             assert is_param_sync(self.module, self.rank), "Parameters are not synced"
 
-        # using flatparamhandle
-        #   - flatten params
-        #   - handle.shard
         handle = FlatParameterHandle(
             params,
             self.module,
@@ -546,6 +545,10 @@ class FSDP(nn.Module):
             self.use_orig_params,
         )
         handle.shard()
+        assert not self._handle, "FSDP already initialized"
+        self.params.append(handle.flat_param)
+        self._handle = handle
+        self._fully_sharded_module_to_handle[handle._fully_sharded_module] = handle
         print(f"Hello in FSDP from rank {self.rank} of {self.world_size}")
 
     def materialize_meta_module(self):
@@ -568,7 +571,8 @@ class FSDP(nn.Module):
         except Exception as e:
             raise e
 
-    def forward(self):
+    def forward(self, *args, **kwargs):
+        handle = self._handle
         # root_pre_forward
         #   - set handles forward prefetch
         #   - set unshard stream for all gather and pre unshard stream for prefetch should wait for computation stream for optimization step
