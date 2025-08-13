@@ -22,7 +22,14 @@ from utils import (
     is_flattened,
     _same_storage_size,
 )
-from runtime_utils import HandleTrainingState
+from runtime_utils import (
+    HandleTrainingState,
+    _root_pre_forward,
+    _pre_forward,
+    _post_forward,
+    _pre_forward_unshard,
+    _post_forward_reshard,
+)
 from model import MLP, DataloaderLite, generate_dataset
 from _flat_param import FlatParameterHandle, HandleShardingStrategy
 
@@ -168,8 +175,17 @@ class FSDP(nn.Module):
         #   - call reshard fn
         #   - register pre backward hook, why here and not in pre_forward?
         #   - set training state to idle, why?
-
-        pass
+        args, kwargs = _root_pre_forward(self, self, args, kwargs)
+        unused = None
+        args, kwargs = _pre_forward(
+            self, handle, _pre_forward_unshard, self._fsdp_wrapped_module, args, kwargs
+        )
+        if handle:
+            assert (
+                handle.flat_param.device == self.compute_device
+            ), f"Expected FlatParameter to be on the compute device {self.compute_device} but got {handle.flat_param.device}"
+        output = self._fsdp_wrapped_module(*args, **kwargs)
+        return _post_forward(self, handle, _post_forward_reshard, self, unused, output)
 
     def print_module(self):
         for idx, m in enumerate(self.module.named_modules()):
