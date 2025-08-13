@@ -1,20 +1,17 @@
 import torch.nn as nn
 import torch
 from utils import (
-    get_orig_params,
     _get_aligned_numel,
     _construct_padding_tensor,
     _is_truly_contiguous,
     _detach_if_needed,
     _convert_to_params,
-    is_param_sync,
-    is_flattened,
     _same_storage_size,
 )
 from itertools import accumulate, chain
 from enum import auto, Enum
 from typing import NamedTuple, Optional
-from runtime_utils import HandleTrainingState
+from utils import HandleTrainingState
 import torch.distributed as dist
 
 
@@ -151,6 +148,7 @@ class FlatParameterHandle:
         self.process_group = process_group
         self.use_orig_params = use_orig_params
         self._fully_sharded_module = fully_sharded_module
+        self._handle_index = None
         self.param_dtype = params[0].dtype
         self.params = params
         self.rank = process_group.rank()

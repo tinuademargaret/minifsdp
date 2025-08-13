@@ -3,21 +3,23 @@ from typing import Any
 import torch
 from enum import auto, Enum
 from utils import (
-    _get_fsdp_handles,
     _get_fsdp_states,
+    _get_fsdp_handles,
+    _get_param_to_fqn,
     _to_kwargs,
     _div_if_needed,
     _no_dispatch_record_stream,
+    HandleTrainingState,
 )
 import torch.distributed as dist
 from _flat_param import (
     HandleShardingStrategy,
     RESHARD_AFTER_FORWARD_HANDLE_STRATEGIES,
-    NO_RESHARD_AFTER_FORWARD_HANDLE_STRATEGIES,
 )
 from torch.autograd.graph import register_multi_grad_hook
 from torch.utils import _pytree as pytree
 from torch.autograd import Variable
+from torch.distributed.fsdp._common_utils import _get_param_to_fqns
 
 
 class TrainingState(Enum):
@@ -27,18 +29,6 @@ class TrainingState(Enum):
 
     IDLE = auto()
     FORWARD_BACKWARD = auto()
-    SUMMON_FULL_PARAMS = auto()
-
-
-class HandleTrainingState(Enum):
-    """
-    An enum that indicates the state of a ``FlatParamHandle`.
-    """
-
-    IDLE = auto()
-    FORWARD = auto()
-    BACKWARD_PRE = auto()
-    BACKWARD_POST = auto()
     SUMMON_FULL_PARAMS = auto()
 
 
@@ -52,8 +42,36 @@ class BackwardPrefetch(Enum):
     BACKWARD_POST = auto()
 
 
-class ExecutionOrder:
-    pass
+class _ExecOrderData:
+
+    def __init__(self, backward_prefetch_limit, forward_prefetch_limit):
+        self.handles_pre_forward_order = []
+        self.handles_post_forward_order = []
+        self._iter = 0
+        self._backward_prefetch_limit = backward_prefetch_limit
+        self._forward_prefetch_limit = forward_prefetch_limit
+
+        self.process_group = None
+        self.world_size = None
+        self.all_handles = []
+        self.param_to_fqn = {}
+        self.current_order_index = 0
+
+    def init(self, root_module, process_group):
+        self.process_group = process_group
+        self.rank = process_group.rank()
+        self.world_size = process_group.size()
+
+        for handle in _get_fsdp_handles(root_module):
+            index = len(self.all_handles)
+            self.all_handles.append(handle)
+            handle._handle_index = index
+        # mapping from flat parameter to it's fully qualified name if use_orig_param is False or from the original parameter to it's fully qualified name if use_orig_param is True
+        self.param_to_fqn = _get_param_to_fqns(root_module)
+
+    @property
+    def is_first_iter(self):
+        return self._iter == 0
 
 
 def _init_streams(state):

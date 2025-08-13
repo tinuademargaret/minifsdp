@@ -1,37 +1,28 @@
 import os
 import itertools
-from itertools import accumulate
-from typing import NamedTuple, Optional
-from enum import auto, Enum
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.distributed_c10d import _get_default_group
+from torch.distributed.fsdp._limiter_utils import _FreeEventQueue
 
 from utils import (
     get_orig_params,
-    _get_aligned_numel,
-    _construct_padding_tensor,
-    _is_truly_contiguous,
-    _detach_if_needed,
-    _convert_to_params,
     is_param_sync,
-    is_flattened,
-    _same_storage_size,
 )
 from runtime_utils import (
-    HandleTrainingState,
     _root_pre_forward,
     _pre_forward,
     _post_forward,
     _pre_forward_unshard,
     _post_forward_reshard,
+    TrainingState,
+    _ExecOrderData,
 )
 from model import MLP, DataloaderLite, generate_dataset
-from _flat_param import FlatParameterHandle, HandleShardingStrategy
+from _flat_param import FlatParameterHandle
 
 PARAM_BROADCAST_BUCKET_SIZE = int(250 * 1024 * 1024)
 
@@ -62,14 +53,22 @@ class FSDP(nn.Module):
         self.module = module
         self.device_id = device_id
 
+        # rate limitiing for backward and forward prefetching so that we don't fill up the stream
+        backward_prefetch_limit = 1
+        forward_prefetch_limit = 1
+
         # get default group created by init_process_group
         self.process_group = _get_default_group()
         self.rank = self.process_group.rank()
         self.world_size = self.process_group.size()
-        self.use_orig_params = use_orig_params
-        self.training_state = "Idle"
-        self.is_root = None
-        self._exec_order_data = None
+        self._use_orig_params = use_orig_params
+        self.training_state = TrainingState.IDLE
+        self._is_root = None
+        self._free_event_queue = _FreeEventQueue()
+        self._exec_order_data = _ExecOrderData(
+            backward_prefetch_limit, forward_prefetch_limit
+        )
+        self._unshard_event = None
         self._fully_sharded_module_to_handle = {}
         self._handle = None
         self.params = []

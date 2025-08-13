@@ -4,8 +4,25 @@ from typing import Union
 import functools
 import torch.distributed as dist
 from torch.utils._mode_utils import no_dispatch
+from enum import Enum, auto
+from typing import Optional, Any, Union
+from torch.distributed._composable.contract import _get_registry
+from torch.distributed._composable_state import _get_module_state
+from torch.distributed.fsdp._common_utils import _FSDPState
 
 _FLAT_PARAM_PADDING_VALUE = 42
+
+
+class HandleTrainingState(Enum):
+    """
+    An enum that indicates the state of a ``FlatParamHandle`.
+    """
+
+    IDLE = auto()
+    FORWARD = auto()
+    BACKWARD_PRE = auto()
+    BACKWARD_POST = auto()
+    SUMMON_FULL_PARAMS = auto()
 
 
 def get_orig_params(module):
@@ -91,11 +108,73 @@ def is_flattened(params, flat_param, is_padding_mask):
     return True
 
 
-def _get_fsdp_handles(module):
-    pass
+def _composable(module):
+    "returns if a module is compatible with fsdp"
+    # registry is a dict of module to distributed training strategy
+    registry = _get_registry(module)
+
+    if registry is None:
+        return True
+    # replicate is a distributed training strategy that replicates the model across all devices as in DDP
+    return "replicate" not in registry
+
+
+def _get_module_fsdp_state(module):
+    # `_get_module_state` returns the distributed training state associated with a module from a global module state mapping
+    state = _get_module_state(module)
+    if state is None or not isinstance(state, _FSDPState):
+        return None
+    return state
+
+
+def _get_fsdp_states_with_modules(module):
+    # returns a tuple of list of fsdp states and list of corresponding modules in the heirachical order from the input module
+    fsdp_states = []
+    fsdp_modules = []
+
+    visited_states = set()
+    visited_modules = set()
+
+    from collections import deque
+
+    submodule_queue = deque([module])
+
+    while submodule_queue:
+
+        submodule = submodule_queue.pop()
+        visited_modules.add(submodule)
+
+        if not _composable(submodule):
+            continue
+
+        for child_module in reversed(list(submodule.children())):
+            if child_module not in visited_modules:
+                submodule_queue.appendleft(child_module)
+
+        state = _get_module_fsdp_state(submodule)
+        if state is not None and state not in visited_states:
+            visited_states.add(state)
+            fsdp_states.append(state)
+            fsdp_modules.append(submodule)
+
+    return fsdp_states, fsdp_modules
 
 
 def _get_fsdp_states(module):
+    fsdp_states, _ = _get_fsdp_states_with_modules(module)
+    return fsdp_states
+
+
+def _get_fsdp_handles(root_module):
+    handles = [
+        fsdp_state._handle
+        for fsdp_state in _get_fsdp_states(root_module)
+        if fsdp_state._handle is not None
+    ]
+    return handles
+
+
+def _get_param_to_fqn(root_module):
     pass
 
 
