@@ -7,10 +7,12 @@ import torch.nn as nn
 import torch.multiprocessing as mp
 from torch.distributed.distributed_c10d import _get_default_group
 from torch.distributed.fsdp._limiter_utils import _FreeEventQueue
+from torch.distributed.fsdp._unshard_param_utils import _register_flat_param
 
 from utils import (
     get_orig_params,
     is_param_sync,
+    _check_orig_params_flattened,
 )
 from runtime_utils import (
     _root_pre_forward,
@@ -80,6 +82,14 @@ class FSDP(nn.Module):
 
         self._fsdp_wrapped_module = module
 
+        if not self._use_orig_params:
+            _check_orig_params_flattened(self)
+            _register_flat_param(self, self)
+
+    @property
+    def _flat_param(self):
+        return self._handle.flat_param if self._handle else None
+
     # this function would handle the materialization and sharding of each unit
     def _init_param_from_module(self):
         # check that all modules are initialized on the same device
@@ -124,7 +134,7 @@ class FSDP(nn.Module):
             self.module,
             self.device_id,
             self.process_group,
-            self.use_orig_params,
+            self._use_orig_params,
         )
         handle.shard()
         assert not self._handle, "FSDP already initialized"

@@ -7,6 +7,7 @@ from utils import (
     _detach_if_needed,
     _convert_to_params,
     _same_storage_size,
+    _set_fsdp_flattened,
 )
 from itertools import accumulate, chain
 from enum import auto, Enum
@@ -65,6 +66,13 @@ class FlatParameter(nn.Parameter):
     Note: we'll also ignore initialization methods e.g xavier initialization for the params
     """
 
+    _unpadded_unsharded_size: torch.Size
+    _sharded_size: torch.Size
+    _shard_param_infos: tuple[_ShardParamInfo, ...]
+    _num_params: int
+    _param_infos: tuple[ParamInfo, ...]
+    _numels_with_padding: tuple[int, ...]
+
     # flat parameter is not a subclass of nn.Parameter, instead it creates a new nn.Parameter object with a new attribute _is_flat_param
     def __new__(cls, data=None, requires_grad=True):
         assert cls is FlatParameter, "subclasses FlatParameter not supported"
@@ -121,6 +129,9 @@ class FlatParameter(nn.Parameter):
 
             self._is_grad_none_mask = [False for _ in range(self._num_params)]
             self._tensors = [None for _ in range(self._num_params)]
+
+            for param in self._params:
+                _set_fsdp_flattened(param)
         else:
             self._params = None
             self._is_grad_none_mask = None
@@ -128,6 +139,7 @@ class FlatParameter(nn.Parameter):
         self._unpadded_unsharded_size = self.size()
         # Tracks whether the `FlatParameter`'s post-backward hook has been
         # called to modify the behavior of the post-backward callback
+        _set_fsdp_flattened(self)
         self._post_backward_called = False
 
 
@@ -144,9 +156,10 @@ class FlatParameterHandle:
         process_group,
         use_orig_params,
     ):
+        params = list(params)
         self.device = device
         self.process_group = process_group
-        self.use_orig_params = use_orig_params
+        self._use_orig_params = use_orig_params
         self._fully_sharded_module = fully_sharded_module
         self._handle_index = None
         self.param_dtype = params[0].dtype
@@ -154,7 +167,9 @@ class FlatParameterHandle:
         self.rank = process_group.rank()
         self.world_size = process_group.size()
 
-        self._training_state = "idle"
+        self._training_state = HandleTrainingState.IDLE
+        self._prefetched = False
+        self._orig_param_dtype = params[0].dtype
 
         align_addresses = use_orig_params
         # get aligned number
@@ -162,7 +177,9 @@ class FlatParameterHandle:
         self._aligned_numel = _get_aligned_numel(self.param_dtype)
 
         # Initialize flat parameter and it's metadata
-        self._init_flat_param_metadata(self._fully_sharded_module, self._aligned_numel)
+        self._init_flat_param_and_metadata(
+            params, fully_sharded_module, self._aligned_numel, use_orig_params
+        )
 
     @property
     def uses_sharded_strategy(self):
@@ -188,9 +205,14 @@ class FlatParameterHandle:
             f"Expects tensor to be on the compute device {self.device}, was on {tensor.device}",
         )
 
-    def _init_flat_param_metadata(self, module, aligned_numel):
+    def _init_flat_param_and_metadata(
+        self, params, module, aligned_numel, use_orig_params
+    ):
 
-        if self._aligned_numel < 0:
+        if len(params) == 0:
+            raise ValueError("No parameters provided")
+
+        if aligned_numel < 0:
             raise ValueError(
                 f"Invalid aligned number: {self._aligned_numel} for dtype: {self.param_dtype}"
             )
@@ -267,14 +289,10 @@ class FlatParameterHandle:
             strides,
             contiguities,
             fqns,
-            # why the use_orig_params is needed here?
+            # FlatParameter should keep original parameter non-flat representation as well if use_orig_params is True
             _convert_to_params(params_to_flatten) if self.use_orig_params else None,
             is_padding_mask,
         )
-
-        # assert is_flattened(
-        #     self.params, self.flat_param._params, is_padding_mask
-        # ), "Params are not flattened"
 
     # this basically means that when you are splitting a module into units one consideration you have to make is that parameters in a unit have the same dtype, device and requires_grad
     def validate_tensors(self):
@@ -330,6 +348,9 @@ class FlatParameterHandle:
     @torch.no_grad()
     def shard(self):
         flat_param = self.flat_param
+        assert (
+            flat_param.storage_offset == 0
+        ), "FlatParameter is not the sole owner of the storage"
         rank = self.rank
         world_size = self.world_size
 
@@ -483,7 +504,7 @@ class FlatParameterHandle:
                 param.data = flat_param[offset : offset + numel_in_shard]
 
         # we've not implemented saving tensors yet
-        if self._training_state == "backward_post":
+        if self._training_state == HandleTrainingState.BACKWARD_POST:
             # Clear the saved `Tensor`s since they are unneeded now
             for i in range(len(self.flat_param._tensors)):
                 self.flat_param._tensors[i] = None

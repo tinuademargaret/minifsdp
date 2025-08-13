@@ -11,6 +11,7 @@ from torch.distributed._composable_state import _get_module_state
 from torch.distributed.fsdp._common_utils import _FSDPState
 
 _FLAT_PARAM_PADDING_VALUE = 42
+FSDP_FLATTENED = "_fsdp_flattened"
 
 
 class HandleTrainingState(Enum):
@@ -213,3 +214,17 @@ def _div_if_needed(tensor: torch.Tensor, div_factor: float) -> None:
 def _no_dispatch_record_stream(tensor, stream):
     with no_dispatch():
         tensor.record_stream(stream)
+
+
+def _set_fsdp_flattened(tensor):
+    setattr(tensor, FSDP_FLATTENED, True)
+
+
+def _is_fsdp_flattened(param):
+    return getattr(param, FSDP_FLATTENED, False)
+
+
+def _check_orig_params_flattened(module):
+    for param_name, param in module.named_parameters():
+        if not _is_fsdp_flattened(param):
+            raise ValueError(f"Parameter {param_name} is not flattened")
