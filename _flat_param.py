@@ -601,6 +601,36 @@ class FlatParameterHandle:
         self._use_unsharded_flat_param(padded_unsharded_flat_param)
         assert self.flat_param.device == self.device, "Expected device to be the same"
 
+    def _prepare_gradient_for_backward(self):
+        assert self._training_state in (
+            HandleTrainingState.BACKWARD_PRE,
+            HandleTrainingState.IDLE,
+        ), "Expects to be in Backward pre or idle state"
+        flat_param = self.flat_param
+        if (
+            flat_param.grad is not None
+            and flat_param.grad.size() != flat_param._unpadded_unsharded_size
+            or flat_param.grad.device != flat_param.device
+        ):
+            self._check_on_compute_device(self.flat_param)
+            prev_iter_synced_gradients = (
+                flat_param.grad.size() == flat_param._local_shard.size()
+            )
+
+            if prev_iter_synced_gradients:
+                flat_param._saved_grad_shard = flat_param.grad.data
+                sharded_grad = flat_param._saved_grad_shard
+
+                local_shard_dtype = flat_param._local_shard.dtype
+
+            else:
+                padded_unsharded_size = flat_param._padded_unsharded_size
+                assert (
+                    flat_param.grad.size() == padded_unsharded_size
+                ), "Expects .grad to be the unsharded gradient in no_sync with size {padded_unsharded_size} but got size {flat_param.grad.size()}"
+
+            flat_param.grad = None
+
     def prepare_gradient_for_optim(self):
 
         def cast_grad_to_param_dtype(flat_param):

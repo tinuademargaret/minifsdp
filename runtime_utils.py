@@ -17,6 +17,7 @@ from _flat_param import (
 )
 from torch.autograd.graph import register_multi_grad_hook
 from torch.utils import _pytree as pytree
+from torch.autograd import Variable
 
 
 class TrainingState(Enum):
@@ -305,6 +306,65 @@ def _get_reduce_scatter_tensors(
     return padded_unsharded_grad, new_sharded_grad
 
 
+def _catch_all_reshard(state):
+    try:
+        if state._handle:
+            already_resharded = (
+                state._handle.flat_param.data_ptr()
+                == state._handle.flat_param._local_shard.data_ptr()
+                and not state._handle._skipped_use_sharded_views
+            )
+            if already_resharded:
+                return
+            free_unsharded_flat_param = _should_free_in_backward(state, state._handle)
+            _reshard(state, state._handle, free_unsharded_flat_param)
+    except Exception as e:
+        assert False, f"Got exception in the catch all reshard for {state}: {str(e)}"
+
+
+def _finalize_params(state):
+    handle = state._handle
+    if not handle:
+        return
+
+    flat_param = handle.flat_param
+
+    if hasattr(flat_param, "_post_backward_hook_state"):
+        post_backward_hook_state_len = len(flat_param._post_backward_hook_state)
+        expected_post_backward_hook_state_len = int(flat_param.requires_grad) + 1
+        assert (
+            post_backward_hook_state_len == expected_post_backward_hook_state_len
+        ), f"Invalid: ``_post_backward_hook_state``: {flat_param._post_backward_hook_state}"
+        flat_param._post_backward_hook_state[-1].remove()
+        delattr(flat_param, "_post_backward_hook_state")
+
+    if flat_param.requires_grad:
+        if not state._sync_gradients:
+            return
+        if not handle._has_optim_in_backward:
+            handle.prepare_gradient_for_optim()
+        assert hasattr(
+            flat_param, "_post_backward_called"
+        ), "Expects _post_backward_called to be set on the FlatParameter"
+        flat_param._post_backward_called = False
+
+
+def _register_post_backward_final_callback(state, module):
+    assert (
+        state._is_root
+    ), "Only the root fsdp instance should register the post backward callback"
+    if state._post_backward_callback_queued:
+        return
+
+    assert state == TrainingState.IDLE
+
+    state._post_backward_callback_queued = True
+
+    Variable._execution_engine.queue_callback(
+        functools.partial(_post_backward_final_callback, state, module)
+    )
+
+
 def _accumulate_sharded_grad(
     state,
     handle,
@@ -415,6 +475,111 @@ def _post_backward_reshard_only_hook(state, handle):
     state.training_state = TrainingState.FORWARD_BACKWARD
     handle._training_state = HandleTrainingState.BACKWARD_POST
     _post_backward_reshard(state, handle)
+
+
+# why is this registered in post forward and then pre backward hook?
+def _post_backward_final_callback(state, module):
+    assert (
+        state._is_root
+    ), "the post backward callback should only be registered on the fsdp root instance"
+
+    root_state = state
+
+    if root_state._sync_gradients:
+        current_stream = state._device_handle.current_stream()
+        current_stream.wait_stream(root_state._post_backward_stream)
+        if root_state._all_reduce_stream is not current_stream:
+            current_stream.wait_stream(root_state._all_reduce_stream)
+
+    root_state._exec_order_data.next_iter()
+
+    for fsdp_state in state._all_fsdp_states:
+        _catch_all_reshard(fsdp_state)
+        _finalize_params(fsdp_state)
+        fsdp_state.training_state = TrainingState.IDLE
+        handle = fsdp_state._handle
+
+        if handle:
+            handle._ran_pre_backward_hook = False
+            handle._needs_pre_backward_unshard = False
+            handle._post_forward_index = None
+            handle._training_state = HandleTrainingState.IDLE
+            handle._prefetched = False
+    # Reset for cases like one forward and multiple backwards
+    root_state._post_backward_callback_queued = False
+
+
+def _pre_backward_hook(state, module, handle, grad):
+
+    if (
+        handle
+        and hasattr(handle, "_ran_pre_backward_hook")
+        and handle._ran_pre_backward_hook
+    ):
+        return grad
+
+    if state._is_root and not state._post_backward_callback_queued:
+        _register_post_backward_final_callback(state, module)
+        _reset_flat_param_grad_info_if_needed(state.all_handles)
+    elif handle:
+        assert state.training_state == TrainingState.IDLE, "Expects to be in IDLE state"
+
+    state.training_state = TrainingState.FORWARD_BACKWARD
+
+    if not handle:
+        return grad
+
+    handle._training_state = HandleTrainingState.BACKWARD_PRE
+
+    if handle._needs_pre_backward_unshard:
+
+        if not handle._prefetched:
+            _unshard(state, handle, state._unshard_stream)
+
+        state._device_handle.current_stream().wait_stream(state._unshard_stream)
+
+    handle._needs_pre_backward_unshard = False
+    _prefetch_handle(state, handle, _PrefetchMode.BACKWARD)
+    handle.prepare_gradient_for_backward()
+    handle._ran_pre_backward_hook = True
+    return grad
+
+
+def _post_forward_reshard(state, handle):
+    if not handle:
+        return
+
+    free_unsharded_flat_param = (
+        not state._is_root
+        and handle._sharding_strategy in RESHARD_AFTER_FORWARD_HANDLE_STRATEGIES
+    )
+
+    _reshard(state, handle, free_unsharded_flat_param)
+
+
+def _register_pre_backward_hooks(state, module, outputs, handle):
+    if not torch.is_grad_enabled():
+        return outputs
+
+    if state._is_root:
+        state._post_backward_callback_queued = False
+
+    if handle:
+        handle._needs_pre_backward_unshard = False
+        handle._ran_pre_backward_hook = False
+
+    def _register_hook(t):
+        if t.requires_grad:
+            t.register_hook(
+                torch.utils.hooks.unserializable_hook(
+                    functools.partial(_pre_backward_hook, state, module, handle)
+                )
+            )
+            if handle:
+                handle._needs_pre_backward_unshard = True
+        return t
+
+    return _apply_to_tensors(_register_hook, outputs)
 
 
 def _register_post_backward_hook(state, handle):
@@ -537,3 +702,21 @@ def _pre_forward(state, handle, unshard_fn, module, args, kwargs):
 
     _register_post_backward_reshard_only_hook(state, handle, args, kwargs)
     return args, kwargs
+
+
+def _post_forward(state, handle, reshard_fn, module, input, output):
+
+    # we don't want to reshard param that has been all gathered during backward prefetching
+    if handle and handle._training_state == HandleTrainingState.BACKWARD_PRE:
+        return output
+
+    state._exec_order_data.record_post_forward(handle)
+
+    if reshard_fn is not None:
+        reshard_fn(state, handle)
+
+    output = _register_pre_backward_hooks(state, module, output, handle)
+    state.training_state = TrainingState.IDLE
+    if handle:
+        handle._training_state = HandleTrainingState.IDLE
+    return output
