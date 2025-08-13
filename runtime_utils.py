@@ -1,6 +1,22 @@
+import functools
+from typing import Any
 import torch
 from enum import auto, Enum
-from utils import _get_fsdp_handles, _get_fsdp_states, _to_kwargs
+from utils import (
+    _get_fsdp_handles,
+    _get_fsdp_states,
+    _to_kwargs,
+    _div_if_needed,
+    _no_dispatch_record_stream,
+)
+import torch.distributed as dist
+from _flat_param import (
+    HandleShardingStrategy,
+    RESHARD_AFTER_FORWARD_HANDLE_STRATEGIES,
+    NO_RESHARD_AFTER_FORWARD_HANDLE_STRATEGIES,
+)
+from torch.autograd.graph import register_multi_grad_hook
+from torch.utils import _pytree as pytree
 
 
 class TrainingState(Enum):
@@ -23,6 +39,16 @@ class HandleTrainingState(Enum):
     BACKWARD_PRE = auto()
     BACKWARD_POST = auto()
     SUMMON_FULL_PARAMS = auto()
+
+
+class _PrefetchMode(Enum):
+    BACKWARD = auto()
+    FORWARD = auto()
+
+
+class BackwardPrefetch(Enum):
+    BACKWARD_PRE = auto()
+    BACKWARD_POST = auto()
 
 
 class ExecutionOrder:
@@ -89,6 +115,19 @@ def _share_state_and_init_handle_attrs(root_state):
         handle = fsdp_state._handle
 
 
+def _unshard(state, handle, unshard_stream):
+    if not handle:
+        return
+
+    if state.limit_all_gathers:
+        event = state._free_event_queue.dequeue_if_needed()
+        if event:
+            event.synchronize()
+
+    with state._device_handle.stream(unshard_stream):
+        handle.unshard()
+
+
 def _lazy_init(state, root_module):
     # already initialized
     if state._is_root is not None:
@@ -115,8 +154,329 @@ def _lazy_init(state, root_module):
     return state
 
 
+def _get_handle_to_prefetch(state, current_handle):
+    assert current_handle is not None, "Expected current handle but got None"
+    valid_training_states = [
+        HandleTrainingState.FORWARD,
+        HandleTrainingState.BACKWARD_PRE,
+        HandleTrainingState.BACKWARD_POST,
+    ]
+    training_state = current_handle._training_state
+    assert (
+        training_state in valid_training_states
+    ), f"Expected training state to be in {valid_training_states} but got {training_state}"
+
+    eod = state._exec_order_data
+    target_handle = None
+
+    if (
+        training_state == HandleTrainingState.BACKWARD_PRE
+        and state.backward_prefetch == BackwardPrefetch.BACKWARD_PRE
+    ) or (
+        training_state == HandleTrainingState.BACKWARD_POST
+        and state.backward_prefetch == BackwardPrefetch.BACKWARD_POST
+    ):
+        target_handle_candidate = eod.get_handle_to_backward_prefetch(current_handle)
+        if (
+            target_handle_candidate
+            and target_handle_candidate._needs_pre_backward_unshard
+            and not target_handle_candidate._prefetched
+        ):
+            target_handle = target_handle_candidate
+        else:
+            target_handle = None
+    elif training_state == HandleTrainingState.FORWARD and state.forward_prefetch:
+        target_handle_candidate = eod.get_handle_to_forward_prefetch(current_handle)
+        if (
+            target_handle_candidate
+            and target_handle_candidate._needs_pre_forward_unshard
+            and not target_handle_candidate._prefetched
+        ):
+            target_handle = target_handle_candidate
+        else:
+            target_handle = None
+
+    return target_handle
+
+
+def _prefetch_handle(state, current_handle, prefetch_mode):
+    if not current_handle:
+        return
+
+    handle = _get_handle_to_prefetch(state, current_handle)
+    if not handle:
+        return
+    prev_training_state = handle._training_state
+    if prefetch_mode == _PrefetchMode.BACKWARD:
+        handle._training_state = HandleTrainingState.BACKWARD_PRE
+    elif prefetch_mode == _PrefetchMode.FORWARD:
+        handle._training_state = HandleTrainingState.FORWARD
+    else:
+        raise ValueError(
+            f"Expected prefetch mode to be _PrefetchMode.BACKWARD or _PrefetchMode.FORWARD but got {prefetch_mode} on rank {state.rank}"
+        )
+
+    _unshard(state, handle, state._unshard_stream, state._pre_unshard_stream)
+    handle._training_state = prev_training_state
+    handle._prefetched = True
+
+
+def _should_free_in_backward(state, handle) -> bool:
+    """
+    Returns whether FSDP should free the unsharded flat parameter in the
+    post-backward or not.
+    """
+    if not handle.uses_sharded_strategy:
+        return False
+    # If not syncing gradients, then we do not free for strategies that do not
+    # reshard after forward as a *heuristic* to tradeoff higher memory for
+    # higher throughput.
+    return (
+        state._sync_gradients
+        or handle._sharding_strategy in RESHARD_AFTER_FORWARD_HANDLE_STRATEGIES
+    )
+
+
+def _post_backward_use_sharded_grad_views(handle):
+    if not handle._use_orig_params:
+        return
+    # Since the handle's `FlatParameter` completed its gradient computation, we
+    # should reset the gradient noneness mask
+    handle._reset_is_grad_none()
+    # Delay using sharded gradient views until after the reduce-scatter instead
+    # of immediately after resharding
+    handle._use_sharded_grad_views()
+    # this is where optimizer in bwd fusion happens
+    if handle._has_optim_in_backward:
+        handle.prepare_gradient_for_optim()
+        for orig_param in handle.flat_param._params:
+            # Check for `None` gradient to filter parameters not in the rank
+            if orig_param.grad is not None and hasattr(
+                orig_param, "_in_backward_optimizers"
+            ):
+                for optim in orig_param._in_backward_optimizers:
+                    optim.step()
+
+                optim.zero_grad(set_to_none=True)
+        handle._reset_flat_param_grad_info_if_needed()
+
+
+def _reduce_grad(state, handle) -> None:
+    """
+    For sharded strategies, this runs gradient reduction, sharded gradient
+    accumulation if needed, and the post-reduction callback.
+    """
+    flat_param = handle.flat_param
+
+    unsharded_grad = flat_param.grad.data
+    flat_param.grad = None
+    padded_unsharded_grad, new_sharded_grad = _get_reduce_scatter_tensors(
+        state, unsharded_grad
+    )
+    if state._comm_hook is None:  # default path
+        _div_if_needed(padded_unsharded_grad, state._gradient_predivide_factor)
+        pg = state.process_group
+
+        dist.reduce_scatter_tensor(
+            new_sharded_grad,
+            padded_unsharded_grad,
+            group=pg,
+        )
+        _div_if_needed(new_sharded_grad, state._gradient_postdivide_factor)
+    else:
+        state._comm_hook(
+            state._comm_hook_state, padded_unsharded_grad, new_sharded_grad
+        )
+    _post_backward_use_sharded_grad_views(handle)
+
+
+def _get_reduce_scatter_tensors(
+    state, unsharded_grad
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns the input and output tensors to reduce-scatter, respectively.
+    """
+    chunks = list(unsharded_grad.chunk(state.world_size))
+    numel_to_pad = state.world_size * chunks[0].numel() - unsharded_grad.numel()
+    padded_unsharded_grad = (
+        F.pad(unsharded_grad, [0, numel_to_pad]) if numel_to_pad > 0 else unsharded_grad
+    )
+    new_sharded_grad = torch.empty_like(chunks[0])  # padded
+    return padded_unsharded_grad, new_sharded_grad
+
+
+def _accumulate_sharded_grad(
+    state,
+    handle,
+    sharded_grad,
+) -> torch.Tensor:
+    """
+    Accumulates the reduce-scattered sharded gradient with any existing sharded
+    gradient if needed, returning the gradient to offload (if CPU offloading is
+    enabled).
+    """
+    flat_param = handle.flat_param
+    _cast_grad_to_param_dtype(state, sharded_grad, flat_param)
+    # Save the sharded gradient in `_saved_grad_shard` to support gradient
+    # accumulation -- for multiple backwards, the gradient reductions may
+    # happen in arbitrary order
+    accumulate_grad = hasattr(flat_param, "_saved_grad_shard")
+    if accumulate_grad:
+        _check_grad_to_accumulate(sharded_grad, flat_param._saved_grad_shard)
+        flat_param._saved_grad_shard += sharded_grad
+    else:
+        flat_param._saved_grad_shard = sharded_grad
+    grad_to_offload = flat_param._saved_grad_shard
+    return grad_to_offload
+
+
+def _reshard(state, handle, free_unsharded_flat_param):
+    handle.reshard(free_unsharded_flat_param)
+    if state.limit_all_gathers and free_unsharded_flat_param:
+        free_event = state._device_handle.Event()
+        free_event.record()
+        state._free_event_queue.enqueue(free_event)
+    handle.post_unshard()
+    handle._prefetched = False
+
+
+def _post_backward_reshard(
+    state,
+    handle,
+    *unused: Any,
+) -> None:
+    free_unsharded_flat_param = _should_free_in_backward(state, handle)
+    _reshard(state, handle, free_unsharded_flat_param)
+
+    # TODO: Post-backward prefetching does not support the multiple handles
+    # per module case since the post-backward hook runs per handle, not per
+    # group of handles.
+    with torch.profiler.record_function(
+        "FullyShardedDataParallel._post_backward_prefetch"
+    ):
+        _prefetch_handle(state, handle, _PrefetchMode.BACKWARD)
+
+
+@torch.no_grad()
+def _post_backward_hook(
+    state,
+    handle,
+    flat_param,
+    *unused: Any,
+):
+    """
+    Reduce-scatters the gradient of ``handle`` 's ``FlatParameter``.
+
+    Precondition: The ``FlatParameter`` 's ``.grad`` attribute contains the
+    unsharded gradient for the local batch.
+
+    Postcondition:
+    - If using ``NO_SHARD``, then the ``.grad`` attribute is the reduced
+    unsharded gradient.
+    - Otherwise, the ``_saved_grad_shard`` attribute is the reduced sharded
+    gradient (accumulating with any existing gradient).
+    """
+    flat_param = handle.flat_param
+    flat_param._post_backward_called = True
+
+    assert state.training_state == TrainingState.FORWARD_BACKWARD
+
+    assert handle._training_state in (
+        HandleTrainingState.BACKWARD_PRE,
+        HandleTrainingState.BACKWARD_POST,
+    ), f"Expects `BACKWARD_PRE` or `BACKWARD_POST` state but got {handle._training_state}"
+
+    handle._training_state = HandleTrainingState.BACKWARD_POST
+
+    if flat_param.grad is None:
+        return
+    if flat_param.grad.requires_grad:
+        raise RuntimeError("FSDP does not support gradients of gradients")
+
+    _post_backward_reshard(state, handle)
+    if not state._sync_gradients:
+        if handle._use_orig_params:
+            handle._use_unsharded_grad_views()
+        return
+
+    state._post_backward_stream.wait_stream(state._device_handle.current_stream())
+
+    with state._device_handle.stream(state._post_backward_stream):
+        autograd_computed_grad = flat_param.grad.data
+        _reduce_grad(state, handle)
+
+        # Since the unsharded gradient is produced in the computation
+        # stream and consumed in the post-backward stream, inform the
+        # caching allocator (before it goes out of scope)
+        _no_dispatch_record_stream(autograd_computed_grad, state._post_backward_stream)
+
+
+def _post_backward_reshard_only_hook(state, handle):
+    state.training_state = TrainingState.FORWARD_BACKWARD
+    handle._training_state = HandleTrainingState.BACKWARD_POST
+    _post_backward_reshard(state, handle)
+
+
+def _register_post_backward_hook(state, handle):
+    # don't  register if gradient is not being calculated
+    if not torch.is_grad_enabled():
+        return
+
+    if not handle:
+        return
+
+    flat_param = handle.flat_param
+
+    already_registered = hasattr(flat_param, "_post_backward_hook_state")
+    if already_registered or not flat_param.requires_grad:
+        return
+
+    temp_flat_param = flat_param.expand_as(flat_param)
+    assert (
+        temp_flat_param.grad_fn is not None
+    ), "grad_fn is needed to access AccumulateGrad"
+
+    acc_grad = temp_flat_param.grad_fn.next_functions[0][0]  # type: ignore[union-attr]
+    assert acc_grad is not None
+    hook_handle = acc_grad.register_hook(
+        functools.partial(_post_backward_hook, state, handle)
+    )
+    flat_param._post_backward_hook_state = (acc_grad, hook_handle)
+
+
+def _register_post_backward_reshard_only_hook(state, handle, args, kwargs):
+    if torch.is_grad_enabled():
+        return
+
+    if not handle:
+        return
+    flat_param = handle.flat_param
+
+    inp_tensors = None
+
+    already_registered = hasattr(flat_param, "_post_backward_hook_state")
+
+    if already_registered or flat_param.requires_grad:
+        return
+
+    if inp_tensors is None:
+        args_flat = pytree.arg_tree_leaves(*args, **kwargs)
+        inp_tensors = [
+            obj for obj in args_flat if torch.is_tensor(obj) and obj.requires_grad
+        ]
+
+    assert inp_tensors is not None
+
+    hook_handle = register_multi_grad_hook(
+        inp_tensors, functools.partial(_post_backward_reshard_only_hook, state, handle)
+    )
+
+    flat_param._post_backward_hook_state = (hook_handle,)
+
+
 def _root_pre_forward(state, module, args, kwargs):
     _lazy_init(state, module)
+    assert state._is_root is not None
     if not state._is_root:
         return args, kwargs
 
@@ -140,4 +500,40 @@ def _root_pre_forward(state, module, args, kwargs):
     args = args_tuple[0] if args_tuple else tuple()
     kwargs = kwargs_tuple[0] if kwargs_tuple else {}
 
+    return args, kwargs
+
+
+def _pre_forward_unshard(state, handle):
+    if not handle:
+        return
+
+    if not handle._prefetched:
+        _unshard(state, handle, state._unshard_stream)
+    handle._needs_pre_forward = False
+
+    current_stream = state._device_handle.current_stream()
+    if state._unshard_event is not None:
+        current_stream.wait_event(state._unshard_event)
+        state._unshard_event = None
+    else:
+        current_stream.wait_stream(state._unshard_stream)
+    # forward prefetch where we try to unshard the next handle in the recorded forward execution order assuming the order of execution is static
+    _prefetch_handle(state, handle, _PrefetchMode.FORWARD)
+
+
+def _pre_forward(state, handle, unshard_fn, module, args, kwargs):
+
+    if handle and handle._training_state == HandleTrainingState.BACKWARD_PRE:
+        return args, kwargs
+
+    state.training_state = TrainingState.FORWARD_BACKWARD
+    state._exec_order_data.record_pre_forward(handle, module.training)
+    if handle:
+        handle._training_state = HandleTrainingState.FORWARD
+    if unshard_fn is not None:
+        unshard_fn(state, handle)
+
+    _register_post_backward_hook(state, handle)
+
+    _register_post_backward_reshard_only_hook(state, handle, args, kwargs)
     return args, kwargs

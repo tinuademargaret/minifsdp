@@ -3,6 +3,7 @@ import torch.nn as nn
 from typing import Union
 import functools
 import torch.distributed as dist
+from torch.utils._mode_utils import no_dispatch
 
 _FLAT_PARAM_PADDING_VALUE = 42
 
@@ -119,3 +120,17 @@ def _to_kwargs(
     elif len(moved_kwargs) < len(moved_inputs):
         moved_kwargs.extend([{} for _ in range(len(moved_inputs) - len(moved_kwargs))])
     return tuple(moved_inputs), tuple(moved_kwargs)
+
+
+def _same_storage_size(a: torch.Tensor, b: int):
+    return a.untyped_storage().size() // a.element_size() == b
+
+
+def _div_if_needed(tensor: torch.Tensor, div_factor: float) -> None:
+    if div_factor > 1:
+        tensor.div_(div_factor)
+
+
+def _no_dispatch_record_stream(tensor, stream):
+    with no_dispatch():
+        tensor.record_stream(stream)
