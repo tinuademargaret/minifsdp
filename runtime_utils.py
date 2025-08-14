@@ -6,7 +6,6 @@ from utils import (
     _get_fsdp_states,
     _get_fsdp_handles,
     _get_param_to_fqn,
-    _to_kwargs,
     _div_if_needed,
     _no_dispatch_record_stream,
     HandleTrainingState,
@@ -20,6 +19,12 @@ from torch.autograd.graph import register_multi_grad_hook
 from torch.utils import _pytree as pytree
 from torch.autograd import Variable
 from torch.distributed.fsdp._common_utils import _get_param_to_fqns
+from torch.distributed.utils import _to_kwargs
+
+HOMOGENEOUS_ATTR_NAMES = (
+    "_use_orig_params",
+    "limit_all_gathers",
+)
 
 
 class TrainingState(Enum):
@@ -110,6 +115,12 @@ def _reset_flat_param_grad_info_if_needed(handles):
 
 def _share_state_and_init_handle_attrs(root_state):
     handle = root_state._handle
+    if handle:
+        handle.init_flat_param_attributes()
+    attr_name_to_values: dict[str, set[Any]] = {}
+    for attr_name in HOMOGENEOUS_ATTR_NAMES:
+        attr_name_to_values[attr_name] = set()
+
     root_state.all_handles = root_state._exec_order_data.all_handles
 
     for handle in root_state.all_handles:
@@ -124,6 +135,10 @@ def _share_state_and_init_handle_attrs(root_state):
         )
 
     for fsdp_state in root_state._all_fsdp_states:
+        for attr_name in HOMOGENEOUS_ATTR_NAMES:
+            assert hasattr(fsdp_state, attr_name), (
+                "fsdp state mising attribute " + attr_name
+            )
         if fsdp_state is root_state:
             continue
         fsdp_state._is_root = False
@@ -131,7 +146,16 @@ def _share_state_and_init_handle_attrs(root_state):
         fsdp_state._post_backward_stream = root_state._post_backward_stream
         fsdp_state._default_stream = root_state._default_stream
         fsdp_state._exec_order_data = root_state._exec_order_data
+        fsdp_state._free_event_queue = root_state._free_event_queue
         handle = fsdp_state._handle
+        if handle:
+            handle.init_flat_param_attributes()
+
+    for attr_name, attr_values in attr_name_to_values.items():
+        if len(attr_values) != 1:
+            raise ValueError(
+                f"Expected only one value for {attr_name} but got {attr_values}"
+            )
 
 
 def _unshard(state, handle, unshard_stream):
@@ -659,7 +683,7 @@ def _register_post_backward_reshard_only_hook(state, handle, args, kwargs):
 
 def _root_pre_forward(state, module, args, kwargs):
     _lazy_init(state, module)
-    assert state._is_root is not None
+    assert state._is_root is not None, "expects a root to have been set"
     if not state._is_root:
         return args, kwargs
 
@@ -672,7 +696,7 @@ def _root_pre_forward(state, module, args, kwargs):
         for handle in handles:
             handle._needs_pre_forward = True
             handle._prefetched = False
-
+    # at this point we are starting a new forward pass, so we need to for compute stream to finish especially for parameter updates to be completed
     _wait_for_computation_stream(
         state._device_handle.current_stream(), state._unshard_stream
     )
@@ -705,7 +729,7 @@ def _pre_forward_unshard(state, handle):
 
 
 def _pre_forward(state, handle, unshard_fn, module, args, kwargs):
-
+    # if we've already prefetched the handle we don't need to do it again
     if handle and handle._training_state == HandleTrainingState.BACKWARD_PRE:
         return args, kwargs
 

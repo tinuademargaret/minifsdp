@@ -14,6 +14,7 @@ from enum import auto, Enum
 from typing import NamedTuple, Optional
 from utils import HandleTrainingState
 import torch.distributed as dist
+from torch.distributed.utils import _free_storage
 
 
 class HandleShardingStrategy(Enum):
@@ -72,6 +73,9 @@ class FlatParameter(nn.Parameter):
     _num_params: int
     _param_infos: tuple[ParamInfo, ...]
     _numels_with_padding: tuple[int, ...]
+    _local_shard: torch.Tensor
+    _full_param_padded: torch.Tensor
+    _padded_unsharded_size: torch.Size
 
     # flat parameter is not a subclass of nn.Parameter, instead it creates a new nn.Parameter object with a new attribute _is_flat_param
     def __new__(cls, data=None, requires_grad=True):
@@ -168,6 +172,7 @@ class FlatParameterHandle:
         self.world_size = process_group.size()
 
         self._training_state = HandleTrainingState.IDLE
+        self._needs_pre_forward_unshard = False
         self._prefetched = False
         self._orig_param_dtype = params[0].dtype
 
@@ -704,3 +709,36 @@ class FlatParameterHandle:
                     )
                 else:
                     param.grad = None
+
+    def init_flat_param_attributes(self):
+        flat_param = self.flat_param
+        self._check_on_compute_device(self.flat_param)
+        flat_param._local_shard = flat_param.data
+
+        unsharded_param_dtype = flat_param.dtype
+        padded_unsharded_numel = flat_param.numel() * self.world_size
+        # empty does not mean free, it just means no meaningful values yet
+        flat_param._full_param_padded = torch.empty(
+            padded_unsharded_numel, device=self.device, dtype=unsharded_param_dtype
+        )
+        flat_param._padded_unsharded_size = flat_param._full_param_padded.size()
+        # free storage but keep tensor object
+        _free_storage(flat_param._full_param_padded)
+
+    def _reset_flat_param_grad_info_if_needed(self):
+        if not self._use_orig_params:
+            return
+
+        flat_param = self.flat_param
+
+        assert flat_param._params is not None
+
+        all_grad_none = True
+        requires_grad = False
+        for param in flat_param._params:
+            all_grad_none &= param.grad is None
+            requires_grad |= param.requires_grad
+        if all_grad_none:
+            flat_param.grad = None
+
+        flat_param.requires_grad = requires_grad

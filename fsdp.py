@@ -8,6 +8,7 @@ import torch.multiprocessing as mp
 from torch.distributed.distributed_c10d import _get_default_group
 from torch.distributed.fsdp._limiter_utils import _FreeEventQueue
 from torch.distributed.fsdp._unshard_param_utils import _register_flat_param
+from torch.distributed.fsdp._common_utils import _FSDPDeviceHandle
 
 from utils import (
     get_orig_params,
@@ -22,6 +23,7 @@ from runtime_utils import (
     _post_forward_reshard,
     TrainingState,
     _ExecOrderData,
+    BackwardPrefetch,
 )
 from model import MLP, DataloaderLite, generate_dataset
 from _flat_param import FlatParameterHandle
@@ -36,6 +38,8 @@ class FSDP(nn.Module):
         module: nn.Module,
         use_orig_params=False,
         device_id=None,
+        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+        forward_prefetch=False,
         sync_module_states=False,
     ):
         """
@@ -50,19 +54,29 @@ class FSDP(nn.Module):
         Note: no mixed precision support
         Note: no support for shared params
         Note: no cpu offloading
+        Note: no checkpointing support
         """
         super().__init__()
         self.module = module
         self.device_id = device_id
-
-        # rate limitiing for backward and forward prefetching so that we don't fill up the stream
-        backward_prefetch_limit = 1
-        forward_prefetch_limit = 1
+        determined_device = (
+            device_id
+            if isinstance(device_id, torch.device)
+            else torch.device(device_id)
+        )
+        self._device_handle = _FSDPDeviceHandle().from_device(determined_device)
 
         # get default group created by init_process_group
         self.process_group = _get_default_group()
         self.rank = self.process_group.rank()
         self.world_size = self.process_group.size()
+
+        # split module into units
+
+        # rate limitiing for backward and forward prefetching so that we don't fill up the stream
+        backward_prefetch_limit = 1
+        forward_prefetch_limit = 1
+
         self._use_orig_params = use_orig_params
         self.training_state = TrainingState.IDLE
         self._is_root = None
@@ -76,7 +90,17 @@ class FSDP(nn.Module):
         self.params = []
         self.sync_module_states = sync_module_states
 
-        # split module into units
+        # runtime state
+        self._root_pre_forward_handles = []
+        self._pre_forward_handles = []
+        self._post_forward_handles = []
+        self._sync_gradients = True
+        self._comm_hook = None
+        self._comm_hook_state = None
+
+        # prefetching state
+        self.backward_prefetch = backward_prefetch
+        self.forward_prefetch = forward_prefetch
 
         self._init_param_from_module()
 
