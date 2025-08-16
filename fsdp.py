@@ -41,6 +41,7 @@ class FSDP(nn.Module):
         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
         forward_prefetch=False,
         sync_module_states=False,
+        limit_all_gathers=True,
     ):
         """
         split module into units, 1 layer -> 1 unit, map?
@@ -79,6 +80,7 @@ class FSDP(nn.Module):
 
         self._use_orig_params = use_orig_params
         self.training_state = TrainingState.IDLE
+        self.limit_all_gathers = limit_all_gathers
         self._is_root = None
         self._free_event_queue = _FreeEventQueue()
         self._exec_order_data = _ExecOrderData(

@@ -1,5 +1,7 @@
 import functools
-from typing import Any
+import itertools
+import warnings
+from typing import Any, Optional, Union
 import torch
 from enum import auto, Enum
 from utils import (
@@ -47,6 +49,14 @@ class BackwardPrefetch(Enum):
     BACKWARD_POST = auto()
 
 
+class _ExecOrderWarnStatus(Enum):
+    """Used internally for execution order validation."""
+
+    NONE = auto()
+    WARNING = auto()
+    WARNED = auto()
+
+
 class _ExecOrderData:
 
     def __init__(self, backward_prefetch_limit, forward_prefetch_limit):
@@ -78,6 +88,174 @@ class _ExecOrderData:
     def is_first_iter(self):
         return self._iter == 0
 
+    def record_pre_forward(self, handle, is_training):
+        if not handle:
+            return
+
+        self._check_order(handle, is_training)
+
+        if not self.is_first_iter or handle._pre_forward_order_index is not None:
+            return
+        index = len(self.handles_pre_forward_order)
+        handle._pre_forward_order_index = index
+        self.handles_pre_forward_order.append(handle)
+
+    def _check_order(self, handle, is_training):
+        if not is_training or not self._checking_order:
+            return
+        if self.is_first_iter:
+            msg_prefix = "Forward order differs across ranks:"
+            optional_local_indices = self._get_handle_indices(handle)
+            device = handle.device  # guaranteed to be non-CPU
+            num_valid_indices = sum(
+                (index is not None) for index in optional_local_indices
+            )
+            tensor_kwargs = {
+                "dtype": torch.int32,
+                "device": device,
+            }
+            world_num_valid_indices = torch.zeros(self.world_size, **tensor_kwargs)
+            local_num_valid_indices = torch.tensor([num_valid_indices], **tensor_kwargs)
+            dist.all_gather_into_tensor(
+                world_num_valid_indices,
+                local_num_valid_indices,
+                group=self.process_group,
+            )
+
+            world_num_valid_indices = world_num_valid_indices.cpu()
+
+            assert self.world_size is not None
+
+            for (r1, n1), (r2, n2) in itertools.combinations(
+                (
+                    (rank, world_num_valid_indices[rank])
+                    for rank in range(self.world_size)
+                ),
+                2,
+            ):
+                if n1 != n2:
+                    raise RuntimeError(
+                        f"{msg_prefix} rank {r1} is all-gathering {n1} parameters "
+                        f"while rank {r2} is all-gathering {n2} parameters"
+                    )
+            world_indices = torch.zeros(
+                self.world_size * num_valid_indices, **tensor_kwargs
+            )
+            local_indices = torch.tensor(optional_local_indices, **tensor_kwargs)
+            dist.all_gather_into_tensor(
+                world_indices, local_indices, group=self.process_group
+            )
+
+            world_indices = world_indices.cpu()
+
+            for (r1, i1), (r2, i2) in itertools.combinations(
+                (
+                    (
+                        rank,
+                        world_indices[
+                            rank * num_valid_indices : (rank + 1) * num_valid_indices
+                        ],
+                    )
+                    for rank in range(self.world_size)
+                ),
+                2,
+            ):
+                if i1 != i2:
+                    r1_param_names = self._get_names_from_handle_indices(i1)
+                    r2_param_names = self._get_names_from_handle_indices(i2)
+                    raise RuntimeError(
+                        f"{msg_prefix} rank {r1} is all-gathering parameters "
+                        f"for {r1_param_names} while rank {r2} is all-gathering "
+                        f"parameters for {r2_param_names}"
+                    )
+        else:
+            if self.warn_status == _ExecOrderWarnStatus.WARNED:
+                return
+            msg_prefix = None
+            if self.current_order_index >= len(self.handles_pre_forward_order):
+                msg_prefix = (
+                    "Expected to not all-gather any more parameters in the "
+                    "forward but trying to all-gather parameters for "
+                )
+            else:
+                expected_handle = self.handles_pre_forward_order[
+                    self.current_order_index
+                ]
+                if expected_handle != handle:
+                    expected_param_names = self._get_names_from_handles(expected_handle)
+                    msg_prefix = (
+                        f"Expected to all-gather for {expected_param_names} "
+                        "but trying to all-gather parameters for "
+                    )
+            if msg_prefix is not None:
+                param_names = self._get_names_from_handles(handle)
+                msg_suffix = (
+                    f"{param_names}"
+                    if param_names
+                    else "a newly-added parameter since construction time"
+                )
+                warnings.warn(
+                    "Forward order differs from that of the first iteration "
+                    f"on rank {self.rank}. Collectives are unchecked and may "
+                    f"give incorrect results or hang.\n{msg_prefix}{msg_suffix}"
+                )
+                self.warn_status = _ExecOrderWarnStatus.WARNING
+            self.current_order_index += 1
+
+    def _get_handle_indices(self, handle):
+        indices: list[Optional[int]] = []
+        if handle:
+            indices.append(handle._handle_index)
+        return tuple(indices)
+
+    def _get_names_from_handles(self, handle):
+        fqns: list[list[str]] = []
+        if handle:
+            flat_param = handle.flat_param
+            if flat_param in self.param_to_fqn:
+                fqns.append(self.param_to_fqn[flat_param])
+        return fqns
+
+    def get_handle_to_backward_prefetch(self, current_handle):
+        """
+        Returns a :class:`list` of the handles keys of the handles to backward
+        prefetch given the current handles key. If there are no valid handles
+        keys to prefetch, then this returns an empty :class:`list`.
+        """
+        current_index = current_handle._post_forward_index
+        if current_index is None:
+            return None
+        target_index = current_index - 1
+        target_handle = None
+        for _ in range(self._backward_prefetch_limit):
+            if target_index < 0:
+                break
+            # does this not overide the handle from the previous iteration?
+            target_handle = self.handles_post_forward_order[target_index]
+            target_index -= 1
+        return target_handle
+
+    def get_handle_to_forward_prefetch(
+        self,
+        current_handle,
+    ):
+        """
+        Returns a :class:`list` of the handles keys of the handles to forward
+        prefetch given the current handles key. If there are no valid handles
+        keys to prefetch, then this returns an empty :class:`list`.
+        """
+        current_index = current_handle._pre_forward_order_index
+        if current_index is None:
+            return None
+        target_index = current_index + 1
+        target_handle = None
+        for _ in range(self._forward_prefetch_limit):
+            if target_index >= len(self.handles_pre_forward_order):
+                break
+            target_handle = self.handles_pre_forward_order[target_index]
+            target_index += 1
+        return target_handle
+
 
 def _init_streams(state):
     assert state._is_root
@@ -97,7 +275,7 @@ def _wait_for_computation_stream(
     For example, this should be called in the FSDP root's pre-forward to
     respect optimizer step computation.
     """
-    unshard_stream.wait_stream(computation_stream)  # type: ignore[attr-defined]
+    unshard_stream.wait_stream(computation_stream)
 
 
 def _reset_flat_param_grad_info_if_needed(handles):
@@ -161,7 +339,9 @@ def _share_state_and_init_handle_attrs(root_state):
 def _unshard(state, handle, unshard_stream):
     if not handle:
         return
-
+    # synchronize with previous all gathers before starting new ones
+    # the unshard stream is like a thread that performs the unsharding the eventqueue manages the amount of unsharding(i.e all-gathers) that can be done concurrently since they are memory intensive
+    # if the event queue is full, we need to dequeue and wait for the event to complete before we can enqueue a new one
     if state.limit_all_gathers:
         event = state._free_event_queue.dequeue_if_needed()
         if event:
@@ -407,31 +587,6 @@ def _register_post_backward_final_callback(state, module):
     )
 
 
-def _accumulate_sharded_grad(
-    state,
-    handle,
-    sharded_grad,
-) -> torch.Tensor:
-    """
-    Accumulates the reduce-scattered sharded gradient with any existing sharded
-    gradient if needed, returning the gradient to offload (if CPU offloading is
-    enabled).
-    """
-    flat_param = handle.flat_param
-    _cast_grad_to_param_dtype(state, sharded_grad, flat_param)
-    # Save the sharded gradient in `_saved_grad_shard` to support gradient
-    # accumulation -- for multiple backwards, the gradient reductions may
-    # happen in arbitrary order
-    accumulate_grad = hasattr(flat_param, "_saved_grad_shard")
-    if accumulate_grad:
-        _check_grad_to_accumulate(sharded_grad, flat_param._saved_grad_shard)
-        flat_param._saved_grad_shard += sharded_grad
-    else:
-        flat_param._saved_grad_shard = sharded_grad
-    grad_to_offload = flat_param._saved_grad_shard
-    return grad_to_offload
-
-
 def _reshard(state, handle, free_unsharded_flat_param):
     handle.reshard(free_unsharded_flat_param)
     if state.limit_all_gathers and free_unsharded_flat_param:
@@ -449,14 +604,8 @@ def _post_backward_reshard(
 ) -> None:
     free_unsharded_flat_param = _should_free_in_backward(state, handle)
     _reshard(state, handle, free_unsharded_flat_param)
-
-    # TODO: Post-backward prefetching does not support the multiple handles
-    # per module case since the post-backward hook runs per handle, not per
-    # group of handles.
-    with torch.profiler.record_function(
-        "FullyShardedDataParallel._post_backward_prefetch"
-    ):
-        _prefetch_handle(state, handle, _PrefetchMode.BACKWARD)
+    # prefetch the next handle to reshard
+    _prefetch_handle(state, handle, _PrefetchMode.BACKWARD)
 
 
 @torch.no_grad()
@@ -717,7 +866,7 @@ def _pre_forward_unshard(state, handle):
     if not handle._prefetched:
         _unshard(state, handle, state._unshard_stream)
     handle._needs_pre_forward = False
-
+    # I'm not sure why we need to wait for the unshard event here, since each state has just one handle and we always wait for all backward computation to finish before starting a new forward pass, I dont't think there should be an overlap of the unsharding of on handle
     current_stream = state._device_handle.current_stream()
     if state._unshard_event is not None:
         current_stream.wait_event(state._unshard_event)

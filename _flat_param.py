@@ -14,7 +14,7 @@ from enum import auto, Enum
 from typing import NamedTuple, Optional
 from utils import HandleTrainingState
 import torch.distributed as dist
-from torch.distributed.utils import _free_storage
+from torch.distributed.utils import _free_storage, _alloc_storage
 
 
 class HandleShardingStrategy(Enum):
@@ -175,8 +175,10 @@ class FlatParameterHandle:
         self._needs_pre_forward_unshard = False
         self._prefetched = False
         self._orig_param_dtype = params[0].dtype
+        self._pre_forward_order_index = None
 
         align_addresses = use_orig_params
+        self._init_get_unflat_views_fn(align_addresses)
         # get aligned number
         # in pytorch they only use this when using orig params but alignment could still be beneficial for GPU computation efficiency even without original parameters
         self._aligned_numel = _get_aligned_numel(self.param_dtype)
@@ -208,6 +210,15 @@ class FlatParameterHandle:
         assert (
             tensor.device == self.device,
             f"Expects tensor to be on the compute device {self.device}, was on {tensor.device}",
+        )
+
+    def _check_unsharded(self, tensor):
+        msg_prefix = "Expects tensor to be unsharded "
+        assert tensor is not None, msg_prefix + "but got `None`"
+        unsharded_size = self.flat_param._unpadded_unsharded_size
+        assert (
+            tensor.size() == unsharded_size,
+            msg_prefix + f"with size {unsharded_size} but got {tensor.size()}",
         )
 
     def _init_flat_param_and_metadata(
@@ -297,6 +308,13 @@ class FlatParameterHandle:
             # FlatParameter should keep original parameter non-flat representation as well if use_orig_params is True
             _convert_to_params(params_to_flatten) if self.use_orig_params else None,
             is_padding_mask,
+        )
+
+    def _init_get_unflat_views_fn(self, align_addresses):
+        self._get_unflat_views = (
+            self._get_unflat_views_aligned
+            if align_addresses
+            else self._get_unflat_views_unaligned
         )
 
     # this basically means that when you are splitting a module into units one consideration you have to make is that parameters in a unit have the same dtype, device and requires_grad
@@ -397,6 +415,71 @@ class FlatParameterHandle:
             len(shard_param_infos) == flat_param._num_params
         ), f"Expects length {flat_param._num_params} but got {len(shard_param_infos)}"
         flat_param._shard_param_infos = shard_param_infos  # type: ignore[attr-defined]
+
+    def _get_unflat_views_aligned(
+        self,
+        tensor=None,
+    ):
+        """
+        Return unflattened ``Tensor`` views into ``tensor`` with handling for padding.
+
+        This method has the same contract as :meth:`_get_unflat_views_unaligned`
+        except it checks for ``None`` placeholders representing padding for
+        alignment, which may incur slightly more CPU overhead.
+        """
+        flat_param = self.flat_param
+        if tensor is None:
+            tensor = flat_param
+        splits = torch.split(tensor, flat_param._numels_with_padding, dim=0)
+        idx = 0
+        views = []
+        for split, is_padding in zip(splits, flat_param._is_padding_mask):
+            if is_padding:
+                continue
+            views.append(
+                (
+                    split.view(flat_param._shapes[idx])
+                    if flat_param._contiguities[idx]
+                    else split.as_strided(
+                        flat_param._shapes[idx], flat_param._strides[idx]
+                    )
+                )
+            )
+
+            idx += 1
+        return views
+
+    def _get_unflat_views_unaligned(
+        self,
+        tensor=None,
+    ):
+        """
+        Return unflattened ``Tensor`` views into ``tensor``.
+
+        If `tensor`` is ``None``,  ``flat_param`` is used. The unflattening is based
+        on ``flat_param`` 's metadata.
+
+        Examples for ``tensor`` include ``flat_param.grad`` or unsharded
+        tensor optimizer state.
+        """
+        flat_param = self.flat_param
+        if tensor is None:
+            tensor = flat_param
+        views = (
+            (
+                subtensor.view(shape)
+                if contiguous
+                else subtensor.as_strided(shape, stride)
+            )
+            for (subtensor, shape, stride, contiguous) in zip(
+                torch.split(tensor, flat_param._numels, dim=0),
+                flat_param._shapes,
+                flat_param._strides,
+                flat_param._contiguities,
+                flat_param._param_extensions,
+            )
+        )
+        return views
 
     def _get_shard_metadata(
         self,
@@ -523,6 +606,10 @@ class FlatParameterHandle:
 
         This is a view into the *padded* unsharded flat parameter.
         """
+        # first of all this attribute _unpadded_unsharded_size doesn't give the unpadded unsharded size of the flat param
+        # also for the slicing of the flat_param_part, the padding is distributed across each actual param in flat param so i'm not sure the slicing gives the unpadded flat_param in the way that we intended.
+        # one way to confirm this is to check that the size of padded_unsharded_flat_param is the same as the size of the flat_param_part
+
         unsharded_size = self.flat_param._unpadded_unsharded_size
         flat_param_part = padded_unsharded_flat_param[: unsharded_size.numel()]
         # slicing [:] is not visible to autograd because of .data
@@ -544,6 +631,44 @@ class FlatParameterHandle:
             )
         elif in_forward:
             self._use_unsharded_views(as_params=False)
+
+    def _use_unsharded_views(self, as_params):
+        flat_param = self.flat_param
+        self._check_unsharded(flat_param)
+        views = self._get_unflat_views()
+
+        for i, (view, (param_name, module, _)) in enumerate(
+            zip(views, flat_param._param_infos)
+        ):
+            if self._use_orig_params and as_params:
+                param = self.flat_param._params[i]
+                self._setattr_param(module, param_name, param)
+                param.data = view
+            elif as_params:
+                self._setattr_param(
+                    module,
+                    param_name,
+                    nn.Parameter(view, requires_grad=flat_param.requires_grad),
+                )
+            else:  # `as_params=False`
+                param_var = view
+                if self._use_orig_params:
+                    if self._training_state == HandleTrainingState.FORWARD:
+                        # Save the `Tensor` for the pre-backward
+                        self.flat_param._tensors[i] = view  # save for pre-backward
+                    elif self._training_state == HandleTrainingState.BACKWARD_PRE:
+                        # Use the saved `Tensor` variable from the forward to
+                        # preserve the autograd graph so that the post-backward
+                        # hook fires (e.g. for reentrant AC)
+                        tensor = self.flat_param._tensors[i]
+                        tensor.data = view
+                        param_var = tensor
+                self._setattr_param(module, param_name, param_var)
+                if (
+                    self._use_orig_params
+                    and self._training_state == HandleTrainingState.FORWARD
+                ):
+                    module._parameters[param_name] = param_var
 
     def _reset_is_grad_none(self):
         if not self._use_orig_params:
@@ -581,7 +706,7 @@ class FlatParameterHandle:
         flat_param = self.flat_param
         unsharded_flat_param = self._get_padded_unsharded_flat_param()
         self._check_storage_freed(unsharded_flat_param)
-        _alloc_storage(unsharded_flat_param, flat_param._padded_unsharded_size)  # type: ignore[attr-defined]
+        _alloc_storage(unsharded_flat_param, flat_param._padded_unsharded_size)
         return unsharded_flat_param
 
     def _check_storage_freed(self, tensor: torch.Tensor) -> None:
