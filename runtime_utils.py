@@ -21,7 +21,7 @@ from torch.autograd.graph import register_multi_grad_hook
 from torch.utils import _pytree as pytree
 from torch.autograd import Variable
 from torch.distributed.fsdp._common_utils import _get_param_to_fqns
-from torch.distributed.utils import _to_kwargs
+from torch.distributed.utils import _to_kwargs, _apply_to_tensors
 
 HOMOGENEOUS_ATTR_NAMES = (
     "_use_orig_params",
@@ -255,6 +255,26 @@ class _ExecOrderData:
             target_handle = self.handles_pre_forward_order[target_index]
             target_index += 1
         return target_handle
+
+    def record_post_forward(self, handle):
+        """
+        Records ``handles`` in the post-forward order, where ``handles`` should
+        be a group of handles used in the same module's forward. If ``handles``
+        is empty, then it is omitted.
+
+        Unlike :meth:`record_pre_forward`, this records the order *every*
+        iteration with the expectation that the recorded order is reset in
+        :meth:`next_iter`.
+        """
+        if not handle:
+            return
+        # Only record the first usage of a handles key
+        if handle._post_forward_index:
+            self.handles_post_forward_order.append(handle)
+            return
+        index = len(self.handles_post_forward_order)
+        handle._post_forward_index = index
+        self.handles_post_forward_order.append(handle)
 
 
 def _init_streams(state):
