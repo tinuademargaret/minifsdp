@@ -275,6 +275,10 @@ class _ExecOrderData:
         index = len(self.handles_post_forward_order)
         handle._post_forward_index = index
         self.handles_post_forward_order.append(handle)
+    
+    def next_iter(self):
+        self._iter += 1
+        self.handles_post_forward_order.clear()
 
 
 def _init_streams(state):
@@ -284,6 +288,7 @@ def _init_streams(state):
     state._default_stream = state._device_handle.current_stream()
     state._unshard_stream = state._device_handle.Stream()
     state._post_backward_stream = state._device_handle.Stream()
+    state._all_reduce_stream = state._default_stream
 
 
 def _wait_for_computation_stream(
@@ -554,7 +559,6 @@ def _catch_all_reshard(state):
             already_resharded = (
                 state._handle.flat_param.data_ptr()
                 == state._handle.flat_param._local_shard.data_ptr()
-                and not state._handle._skipped_use_sharded_views
             )
             if already_resharded:
                 return
@@ -598,7 +602,7 @@ def _register_post_backward_final_callback(state, module):
     if state._post_backward_callback_queued:
         return
 
-    assert state == TrainingState.IDLE
+    assert state.training_state == TrainingState.IDLE
 
     state._post_backward_callback_queued = True
 
@@ -610,7 +614,7 @@ def _register_post_backward_final_callback(state, module):
 def _reshard(state, handle, free_unsharded_flat_param):
     handle.reshard(free_unsharded_flat_param)
     if state.limit_all_gathers and free_unsharded_flat_param:
-        free_event = state._device_handle.event()
+        free_event = state._device_handle.Event()
         free_event.record()
         state._free_event_queue.enqueue(free_event)
     handle._prefetched = False

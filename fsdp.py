@@ -9,6 +9,7 @@ from torch.distributed.distributed_c10d import _get_default_group
 from torch.distributed.fsdp._limiter_utils import _FreeEventQueue
 from torch.distributed.fsdp._unshard_param_utils import _register_flat_param
 from torch.distributed.fsdp._common_utils import _FSDPState,_FSDPDeviceHandle
+from torch.distributed.algorithms._comm_hooks import default_hooks
 
 from utils import (
     get_orig_params,
@@ -71,6 +72,16 @@ class FSDP(nn.Module, _FSDPState):
         self.process_group = _get_default_group()
         self.rank = self.process_group.rank()
         self.world_size = self.process_group.size()
+
+        data_parallel_world_size = self.world_size
+        self._gradient_predivide_factor = (
+            default_hooks.DefaultState._get_gradient_predivide_factor(
+                data_parallel_world_size
+            )
+        )
+        self._gradient_postdivide_factor = (
+            data_parallel_world_size / self._gradient_predivide_factor
+        )
 
         # split module into units
 

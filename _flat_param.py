@@ -80,6 +80,8 @@ class FlatParameter(nn.Parameter):
     _local_shard: torch.Tensor
     _full_param_padded: torch.Tensor
     _padded_unsharded_size: torch.Size
+    _cpu_grad: torch.Tensor
+    _saved_grad_shard: torch.Tensor
 
     # flat parameter is not a subclass of nn.Parameter, instead it creates a new nn.Parameter object with a new attribute _is_flat_param
     def __new__(cls, data=None, requires_grad=True):
@@ -167,11 +169,13 @@ class FlatParameterHandle:
     ):
         params = list(params)
         self.device = device
-        self._device_handle = _FSDPDeviceHandle.from_device(self.device)
+        self._device_handle = _FSDPDeviceHandle.from_device(torch.device(device))
         self.process_group = process_group
         self._use_orig_params = use_orig_params
         self._fully_sharded_module = fully_sharded_module
         self._handle_index = None
+        self._pre_forward_order_index = None
+        self._post_forward_index = None
         self.param_dtype = params[0].dtype
         self.params = params
         self.rank = process_group.rank()
@@ -198,6 +202,19 @@ class FlatParameterHandle:
     @property
     def uses_sharded_strategy(self):
         return self._sharding_strategy != HandleShardingStrategy.NO_SHARD
+
+    @property
+    def sharded_grad(self):
+        flat_param = self.flat_param
+        grad = None
+        if hasattr(flat_param, "_cpu_grad"):
+            grad = flat_param._cpu_grad
+        elif hasattr(flat_param, "_saved_grad_shard"):
+            grad = flat_param._saved_grad_shard
+        else:
+            assert flat_param.grad is None or not self.uses_sharded_strategy or self._training_state in (HandleTrainingState.FORWARD, HandleTrainingState.IDLE), "Sharded strategies should use `_cpu_grad` or `_saved_grad_shard` " "unless in IDLE or FORWARD"
+            grad = flat_param.grad
+        return grad
 
     def _setattr_param(self, module, param_name, param):
         if hasattr(module, param_name):
@@ -621,15 +638,6 @@ class FlatParameterHandle:
         in_forward = self._training_state == HandleTrainingState.FORWARD
         in_pre_backward = self._training_state == HandleTrainingState.BACKWARD_PRE
         if self._use_orig_params:
-            if self._skipped_use_sharded_views and in_pre_backward:
-                # This call corresponds to the complementary pre-backward
-                # `_use_unsharded_views()` to the skipped pre-forward
-                # `_use_sharded_views()`, so we should skip this one too.
-                return
-            # We use `Tensor` views in the forward so that they are tracked by
-            # autograd. We use them in the pre-backward as well to support
-            # reentrant activation checkpointing, which needs the views to be
-            # tracked by autograd in the backward pass's recomputed forward.
             self._use_unsharded_views(
                 as_params=(not in_forward and not in_pre_backward)
             )
@@ -740,7 +748,7 @@ class FlatParameterHandle:
 
     def _free_unsharded_flat_param(self):
 
-        if self._uses_sharded_strategy:
+        if self.uses_sharded_strategy:
             unsharded_flat_param = self.flat_param._full_param_padded
             self._check_on_compute_device(unsharded_flat_param)
             _no_dispatch_record_stream(
@@ -786,17 +794,15 @@ class FlatParameterHandle:
         unsharded_flat_param = self._alloc_padded_unsharded_flat_param()
         padded_unsharded_flat_param = self._all_gather_flat_param(unsharded_flat_param)
         self._use_unsharded_flat_param(padded_unsharded_flat_param)
-        assert self.flat_param.device == self.device, "Expected device to be the same"
-
-    def _prepare_gradient_for_backward(self):
+        
+    def prepare_gradient_for_backward(self):
         assert self._training_state in (
             HandleTrainingState.BACKWARD_PRE,
             HandleTrainingState.IDLE,
         ), "Expects to be in Backward pre or idle state"
         flat_param = self.flat_param
-        if (
-            flat_param.grad is not None
-            and flat_param.grad.size() != flat_param._unpadded_unsharded_size
+        if flat_param.grad is not None and (
+            flat_param.grad.size() != flat_param._unpadded_unsharded_size
             or flat_param.grad.device != flat_param.device
         ):
             self._check_on_compute_device(self.flat_param)
@@ -828,7 +834,13 @@ class FlatParameterHandle:
 
         flat_param = self.flat_param
 
-        if hasattr(flat_param, "_saved_grad_shard"):
+        if hasattr(flat_param, "_cpu_grad"):
+            # NOTE: This branch includes `NO_SHARD`.
+            self._check_sharded(flat_param)
+            assert flat_param.device == torch.device("cpu"), "Expected grad to be on cpu"
+            flat_param.grad = flat_param._cpu_grad
+
+        elif hasattr(flat_param, "_saved_grad_shard"):
             self._check_sharded(flat_param.grad)
             self._check_on_compute_device(flat_param)
             if flat_param._saved_grad_shard is not None:
@@ -852,7 +864,7 @@ class FlatParameterHandle:
         self._check_sharded(flat_param)
         grad = self.sharded_grad
         if grad is None:
-            for param in chain(flat_param._params, flat_param._sharded_params):
+            for param in flat_param._params:
                 param.grad = None
             return
         self._check_sharded(grad)
