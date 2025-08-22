@@ -372,8 +372,8 @@ class FlatParameterHandle:
     def shard(self):
         flat_param = self.flat_param
         assert (
-            flat_param.storage_offset == 0
-        ), "FlatParameter is not the sole owner of the storage"
+            flat_param.storage_offset() == 0
+        ), f"FlatParameter is not the sole owner of the storage: {flat_param.storage_offset()}"
         rank = self.rank
         world_size = self.world_size
 
