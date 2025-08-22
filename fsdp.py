@@ -8,7 +8,7 @@ import torch.multiprocessing as mp
 from torch.distributed.distributed_c10d import _get_default_group
 from torch.distributed.fsdp._limiter_utils import _FreeEventQueue
 from torch.distributed.fsdp._unshard_param_utils import _register_flat_param
-from torch.distributed.fsdp._common_utils import _FSDPDeviceHandle
+from torch.distributed.fsdp._common_utils import _FSDPState,_FSDPDeviceHandle
 
 from utils import (
     get_orig_params,
@@ -31,7 +31,7 @@ from _flat_param import FlatParameterHandle
 PARAM_BROADCAST_BUCKET_SIZE = int(250 * 1024 * 1024)
 
 
-class FSDP(nn.Module):
+class FSDP(nn.Module, _FSDPState):
 
     def __init__(
         self,
@@ -227,22 +227,15 @@ class FSDP(nn.Module):
             print(idx, "->", m)
 
 
-def main(device_id):
+def main(rank, world_size, device_id):
+    print(f"Hello from rank {rank} of {world_size} of {device_id}")
+    assert rank == dist.get_rank()
+    assert world_size == dist.get_world_size()
     # deffered initialization of the model
     module = MLP().to(device="meta")
     fsdp_model = FSDP(module, device_id=device_id, use_orig_params=True)
     fsdp_model.print_module()
-
-
-def run(rank, world_size, device=None):
-    print(f"Hello from rank {rank} of {world_size} of {device}")
-    assert rank == dist.get_rank()
-    assert world_size == dist.get_world_size()
-
-    with torch.device("meta"):
-        model = MLP()
-    fsdp_model = FSDP(model)
-    optimizer = torch.optim.SGD(model.parameters())
+    optimizer = torch.optim.SGD(fsdp_model.parameters())
     mse_loss = nn.MSELoss()
 
     bsz = 50
@@ -253,22 +246,58 @@ def run(rank, world_size, device=None):
     else:
         x = torch.empty((5000, 512))
         y = torch.empty((5000, 10))
-    dist.broadcast(x, src=0)
-    dist.broadcast(y, src=0)
+
 
     dataloader = DataloaderLite(bsz, x, y, rank, world_size)
 
     for i in range(epochs):
         for j in range(len(x) // (world_size * bsz)):
             optimizer.zero_grad()
-            input, target = dataloader.next_batch()
-            # input, target = input.to(device), target.to(device)
-            output = fsdp_model(input)
-            loss = mse_loss(output, target)
+            x, y = dataloader.next_batch()
+            x, y = x.to(device_id), y.to(device_id)
+            output = fsdp_model(x)
+            loss = mse_loss(output, y)
             loss.backward()
             optimizer.step()
         if rank == 0:
             print(f"epoch: {i}, loss: {loss.item()}")
+
+
+# def run(rank, world_size, device=None):
+#     print(f"Hello from rank {rank} of {world_size} of {device}")
+#     assert rank == dist.get_rank()
+#     assert world_size == dist.get_world_size()
+
+#     with torch.device("meta"):
+#         model = MLP()
+#     fsdp_model = FSDP(model)
+#     optimizer = torch.optim.SGD(model.parameters())
+#     mse_loss = nn.MSELoss()
+
+#     bsz = 50
+#     epochs = 100
+
+#     if rank == 0:
+#         x, y = generate_dataset()
+#     else:
+#         x = torch.empty((5000, 512))
+#         y = torch.empty((5000, 10))
+#     dist.broadcast(x, src=0)
+#     dist.broadcast(y, src=0)
+
+#     dataloader = DataloaderLite(bsz, x, y, rank, world_size)
+
+#     for i in range(epochs):
+#         for j in range(len(x) // (world_size * bsz)):
+#             optimizer.zero_grad()
+#             input, target = dataloader.next_batch()
+#             # input, target = input.to(device), target.to(device)
+#             output = fsdp_model(input)
+#             loss = mse_loss(output, target)
+#             loss.backward()
+#             optimizer.step()
+#         if rank == 0:
+#             print(f"epoch: {i}, loss: {loss.item()}")
 
 
 def init_process(rank=None, world_size=None, fn=None, backend="gloo", device=None):
@@ -285,7 +314,7 @@ def init_process(rank=None, world_size=None, fn=None, backend="gloo", device=Non
         world_size = dist.get_world_size()
         device = f"cuda:{rank}"
         # try:
-        fn(device)
+        fn(rank, world_size, device)
         # except Exception as e:
         #     print(f"Error: {e}")
         #     dist.destroy_process_group()

@@ -331,12 +331,12 @@ def _share_state_and_init_handle_attrs(root_state):
         handle._has_optim_in_backward = flat_param._params is not None and any(
             hasattr(param, "_in_backward_optimizers") for param in flat_param._params
         )
-
     for fsdp_state in root_state._all_fsdp_states:
         for attr_name in HOMOGENEOUS_ATTR_NAMES:
             assert hasattr(fsdp_state, attr_name), (
                 "fsdp state mising attribute " + attr_name
             )
+            attr_name_to_values[attr_name].add(getattr(fsdp_state, attr_name))
         if fsdp_state is root_state:
             continue
         fsdp_state._is_root = False
@@ -352,7 +352,7 @@ def _share_state_and_init_handle_attrs(root_state):
     for attr_name, attr_values in attr_name_to_values.items():
         if len(attr_values) != 1:
             raise ValueError(
-                f"Expected only one value for {attr_name} but got {attr_values}"
+                f"Expected only one value for {attr_name} but got {len(attr_values)}"
             )
 
 
@@ -389,7 +389,7 @@ def _lazy_init(state, root_module):
 
     state._all_fsdp_states = _get_fsdp_states(root_module)
     _init_streams(state)
-    state._exec_order_data.init(state, root_module, state.process_group)
+    state._exec_order_data.init(root_module, state.process_group)
 
     # share state and init handle attr
     _share_state_and_init_handle_attrs(state)

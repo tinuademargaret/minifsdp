@@ -9,6 +9,7 @@ from typing import Optional, Any, Union
 from torch.distributed._composable.contract import _get_registry
 from torch.distributed._composable_state import _get_module_state
 from torch.distributed.fsdp._common_utils import _FSDPState
+import collections
 
 _FLAT_PARAM_PADDING_VALUE = 42
 FSDP_FLATTENED = "_fsdp_flattened"
@@ -132,32 +133,24 @@ def _get_fsdp_states_with_modules(module):
     # returns a tuple of list of fsdp states and list of corresponding modules in the heirachical order from the input module
     fsdp_states = []
     fsdp_modules = []
-
-    visited_states = set()
+    
+    visited_fsdp_states = set()
     visited_modules = set()
 
-    from collections import deque
-
-    submodule_queue = deque([module])
-
-    while submodule_queue:
-
-        submodule = submodule_queue.pop()
+    deque: collections.deque[nn.Module] = collections.deque([module])
+    while deque:
+        submodule = deque.popleft()
         visited_modules.add(submodule)
-
         if not _composable(submodule):
             continue
-
         for child_module in reversed(list(submodule.children())):
             if child_module not in visited_modules:
-                submodule_queue.appendleft(child_module)
-
-        state = _get_module_fsdp_state(submodule)
-        if state is not None and state not in visited_states:
-            visited_states.add(state)
-            fsdp_states.append(state)
+                deque.appendleft(child_module)
+        optional_state = _get_module_fsdp_state(submodule)
+        if optional_state is not None and optional_state not in visited_fsdp_states:
+            visited_fsdp_states.add(optional_state)
+            fsdp_states.append(optional_state)
             fsdp_modules.append(submodule)
-
     return fsdp_states, fsdp_modules
 
 
