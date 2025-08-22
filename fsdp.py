@@ -65,7 +65,7 @@ class FSDP(nn.Module):
             if isinstance(device_id, torch.device)
             else torch.device(device_id)
         )
-        self._device_handle = _FSDPDeviceHandle().from_device(determined_device)
+        self._device_handle = _FSDPDeviceHandle.from_device(determined_device)
 
         # get default group created by init_process_group
         self.process_group = _get_default_group()

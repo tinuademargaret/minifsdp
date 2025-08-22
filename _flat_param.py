@@ -306,7 +306,7 @@ class FlatParameterHandle:
             contiguities,
             fqns,
             # FlatParameter should keep original parameter non-flat representation as well if use_orig_params is True
-            _convert_to_params(params_to_flatten) if self.use_orig_params else None,
+            _convert_to_params(params_to_flatten) if self._use_orig_params else None,
             is_padding_mask,
         )
 
@@ -334,7 +334,7 @@ class FlatParameterHandle:
                     f"and {param.dtype}"
                 )
             if (
-                not self.use_orig_params
+                not self._use_orig_params
                 and param_requires_grad is not None
                 and param.requires_grad != param_requires_grad
             ):
@@ -398,7 +398,7 @@ class FlatParameterHandle:
         start_idx = shard.numel() * self.rank
         end_idx = shard.numel() * (self.rank + 1) - 1
         self._init_shard_metadata(start_idx, end_idx)
-        if self.use_orig_params:
+        if self._use_orig_params:
             self._use_sharded_views()
 
     def _init_shard_metadata(self, start_idx, end_idx):
