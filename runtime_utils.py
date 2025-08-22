@@ -101,7 +101,7 @@ class _ExecOrderData:
         self.handles_pre_forward_order.append(handle)
 
     def _check_order(self, handle, is_training):
-        if not is_training or not self._checking_order:
+        if not is_training:
             return
         if self.is_first_iter:
             msg_prefix = "Forward order differs across ranks:"

@@ -26,7 +26,7 @@ from runtime_utils import (
     BackwardPrefetch,
 )
 from model import MLP, DataloaderLite, generate_dataset
-from _flat_param import FlatParameterHandle
+from _flat_param import FlatParameterHandle, HandleShardingStrategy
 
 PARAM_BROADCAST_BUCKET_SIZE = int(250 * 1024 * 1024)
 
@@ -112,6 +112,10 @@ class FSDP(nn.Module, _FSDPState):
             _check_orig_params_flattened(self)
             _register_flat_param(self, self)
 
+        if device_id is not None:
+            assert torch.device(device_id) == torch.device(self._device_handle.current_device()), f"Device ID {device_id} does not match {self._device_handle.current_device()}"
+        self.compute_device = torch.device(self._device_handle.current_device())
+
     @property
     def _flat_param(self):
         return self._handle.flat_param if self._handle else None
@@ -161,6 +165,7 @@ class FSDP(nn.Module, _FSDPState):
             self.device_id,
             self.process_group,
             self._use_orig_params,
+            HandleShardingStrategy.FULL_SHARD,
         )
         handle.shard()
         assert not self._handle, "FSDP already initialized"

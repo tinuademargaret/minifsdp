@@ -159,6 +159,7 @@ class FlatParameterHandle:
         device,
         process_group,
         use_orig_params,
+        sharding_strategy,
     ):
         params = list(params)
         self.device = device
@@ -176,6 +177,7 @@ class FlatParameterHandle:
         self._prefetched = False
         self._orig_param_dtype = params[0].dtype
         self._pre_forward_order_index = None
+        self._sharding_strategy = sharding_strategy
 
         align_addresses = use_orig_params
         self._init_get_unflat_views_fn(align_addresses)
@@ -553,9 +555,6 @@ class FlatParameterHandle:
         return param_offsets
 
     def _get_padded_unsharded_flat_param(self):
-        assert (
-            self._sharding_strategy != HandleShardingStrategy.NO_SHARD
-        ), "Expected sharding strategy but got NO_SHARD"
         flat_param = self.flat_param
         return flat_param._full_param_padded
 
