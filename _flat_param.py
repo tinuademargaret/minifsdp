@@ -15,6 +15,10 @@ from typing import NamedTuple, Optional
 from utils import HandleTrainingState
 import torch.distributed as dist
 from torch.distributed.utils import _free_storage, _alloc_storage
+from torch.distributed.fsdp._common_utils import (
+    _no_dispatch_record_stream,
+    _FSDPDeviceHandle,
+)
 
 
 class HandleShardingStrategy(Enum):
@@ -163,6 +167,7 @@ class FlatParameterHandle:
     ):
         params = list(params)
         self.device = device
+        self._device_handle = _FSDPDeviceHandle.from_device(self.device)
         self.process_group = process_group
         self._use_orig_params = use_orig_params
         self._fully_sharded_module = fully_sharded_module
@@ -732,6 +737,40 @@ class FlatParameterHandle:
         dist.all_gather_into_tensor(padded_unsharded_flat_param, sharded_flat_param, pg)
 
         return padded_unsharded_flat_param
+
+    def _free_unsharded_flat_param(self):
+
+        if self._uses_sharded_strategy:
+            unsharded_flat_param = self.flat_param._full_param_padded
+            self._check_on_compute_device(unsharded_flat_param)
+            _no_dispatch_record_stream(
+                unsharded_flat_param, self._device_handle.current_stream()
+            )
+            _free_storage(unsharded_flat_param)
+
+    def _use_sharded_flat_param(self):
+        flat_param = self.flat_param
+        # note that we are never going to skip views because we are only using the fully sharded flat param
+        flat_param.data = flat_param._local_shard
+        if self._use_orig_params:
+            self._use_sharded_views()
+
+            if self._training_state == HandleTrainingState.FORWARD:
+
+                accumulated_grad_in_no_sync = (
+                    flat_param.grad is not None
+                    and self.uses_sharded_strategy
+                    and flat_param.grad.shape == flat_param._unpadded_unsharded_size
+                )
+                if accumulated_grad_in_no_sync:
+                    self._use_unsharded_grad_views()
+                else:
+                    self._use_sharded_grad_views()
+
+    def reshard(self, free_unsharded_flat_param):
+        self._use_sharded_flat_param()
+        if free_unsharded_flat_param:
+            self._free_unsharded_flat_param()
 
     def unshard(self):
 

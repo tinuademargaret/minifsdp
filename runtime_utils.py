@@ -610,10 +610,9 @@ def _register_post_backward_final_callback(state, module):
 def _reshard(state, handle, free_unsharded_flat_param):
     handle.reshard(free_unsharded_flat_param)
     if state.limit_all_gathers and free_unsharded_flat_param:
-        free_event = state._device_handle.Event()
+        free_event = state._device_handle.event()
         free_event.record()
         state._free_event_queue.enqueue(free_event)
-    handle.post_unshard()
     handle._prefetched = False
 
 
