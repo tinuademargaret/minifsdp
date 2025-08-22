@@ -271,8 +271,15 @@ def run(rank, world_size, device=None):
             print(f"epoch: {i}, loss: {loss.item()}")
 
 
-def init_process(rank=None, world_size=None, fn=None, backend="gloo", cuda=False):
-    if cuda:
+def init_process(rank=None, world_size=None, fn=None, backend="gloo", device=None):
+    if device == "mps":
+        os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+        dist.init_process_group(backend=backend)
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        device = f"mps:{rank}"
+        fn(device)
+    elif device == "cuda":
         dist.init_process_group(backend=backend)
         rank = dist.get_rank()
         world_size = dist.get_world_size()
@@ -296,9 +303,15 @@ def init_process(rank=None, world_size=None, fn=None, backend="gloo", cuda=False
 
 if __name__ == "__main__":
     cuda = torch.cuda.is_available()
-    if cuda:
-        init_process(fn=main, backend="nccl", cuda=True)
+    mps = torch.backends.mps.is_available()
+    if mps:
+        print("Using MPS")
+        init_process(fn=main, device="mps")
+    elif cuda:
+        print("Using CUDA")
+        init_process(fn=main, backend="nccl", device="cuda")
     else:
+        print("Using CPU")
         world_size = 2
         processes = []
 
