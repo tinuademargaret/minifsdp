@@ -32,11 +32,11 @@ def run(rank, world_size, device=None):
         x = torch.empty((5000, 512))
         y = torch.empty((5000, 10))
 
-    # x = x.to(device)
-    # y = y.to(device)
+    x = x.to(device)
+    y = y.to(device)
 
-    # dist.broadcast(x, src=0)
-    # dist.broadcast(y, src=0)
+    dist.broadcast(x, src=0)
+    dist.broadcast(y, src=0)
 
     dataloader = DataloaderLite(bsz, x, y, rank, world_size)
 
@@ -44,7 +44,7 @@ def run(rank, world_size, device=None):
         for j in range(len(x) // (world_size * bsz)):
             optimizer.zero_grad()
             x, y = dataloader.next_batch()
-            x, y = x.to(device), y.to(device)
+            # x, y = x.to(device), y.to(device)
             output = ddp_model(x)
             loss = mse_loss(output, y)
             loss.backward()

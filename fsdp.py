@@ -8,7 +8,7 @@ import torch.multiprocessing as mp
 from torch.distributed.distributed_c10d import _get_default_group
 from torch.distributed.fsdp._limiter_utils import _FreeEventQueue
 from torch.distributed.fsdp._unshard_param_utils import _register_flat_param
-from torch.distributed.fsdp._common_utils import _FSDPState,_FSDPDeviceHandle
+from torch.distributed.fsdp._common_utils import _FSDPState, _FSDPDeviceHandle
 from torch.distributed.algorithms._comm_hooks import default_hooks
 
 from utils import (
@@ -124,7 +124,9 @@ class FSDP(nn.Module, _FSDPState):
             _register_flat_param(self, self)
 
         if device_id is not None:
-            assert torch.device(device_id) == torch.device(self._device_handle.current_device()), f"Device ID {device_id} does not match {self._device_handle.current_device()}"
+            assert torch.device(device_id) == torch.device(
+                self._device_handle.current_device()
+            ), f"Device ID {device_id} does not match {self._device_handle.current_device()}"
         self.compute_device = torch.device(self._device_handle.current_device())
 
     @property
@@ -263,6 +265,11 @@ def main(rank, world_size, device_id):
         x = torch.empty((5000, 512))
         y = torch.empty((5000, 10))
 
+    x = x.to(device_id)
+    y = y.to(device_id)
+
+    dist.broadcast(x, src=0)
+    dist.broadcast(y, src=0)
 
     dataloader = DataloaderLite(bsz, x, y, rank, world_size)
 
@@ -270,7 +277,7 @@ def main(rank, world_size, device_id):
         for j in range(len(x) // (world_size * bsz)):
             optimizer.zero_grad()
             x, y = dataloader.next_batch()
-            x, y = x.to(device_id), y.to(device_id)
+            # x, y = x.to(device_id), y.to(device_id)
             output = fsdp_model(x)
             loss = mse_loss(output, y)
             loss.backward()
