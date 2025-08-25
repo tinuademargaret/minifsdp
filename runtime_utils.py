@@ -465,7 +465,7 @@ def _prefetch_handle(state, current_handle, prefetch_mode):
             f"Expected prefetch mode to be _PrefetchMode.BACKWARD or _PrefetchMode.FORWARD but got {prefetch_mode} on rank {state.rank}"
         )
 
-    _unshard(state, handle, state._unshard_stream, state._pre_unshard_stream)
+    _unshard(state, handle, state._unshard_stream)
     handle._training_state = prev_training_state
     handle._prefetched = True
 

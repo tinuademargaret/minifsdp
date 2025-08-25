@@ -31,6 +31,22 @@ from _flat_param import FlatParameterHandle, HandleShardingStrategy
 
 PARAM_BROADCAST_BUCKET_SIZE = int(250 * 1024 * 1024)
 
+def has_params(m):
+    n_params = sum(p.numel() for p in m.parameters())
+    if n_params > 0:
+        return True
+    else:
+        return False
+
+def wrap_module(root_module, wrapper_cls, **kwargs):
+    """wraps children module in FSDP. In this case we avoid nested modules in the model
+    so we wrap each layer in the model"""
+    for name, child in root_module.named_children():
+        if isinstance(child, nn.Module) and has_params(child):
+            print(f"Wrapping {name}")
+            wrapped_child = wrapper_cls(child, **kwargs)
+            setattr(root_module, name, wrapped_child)
+
 
 class FSDP(nn.Module, _FSDPState):
 
@@ -40,7 +56,7 @@ class FSDP(nn.Module, _FSDPState):
         use_orig_params=False,
         device_id=None,
         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-        forward_prefetch=False,
+        forward_prefetch=True,
         sync_module_states=False,
         limit_all_gathers=True,
     ):
@@ -84,6 +100,16 @@ class FSDP(nn.Module, _FSDPState):
         )
 
         # split module into units
+        wrapper_kwargs = {
+            "backward_prefetch": backward_prefetch,
+            "device_id": device_id,
+            "sync_module_states": sync_module_states,
+            "forward_prefetch": forward_prefetch,
+            "limit_all_gathers": limit_all_gathers,
+            "use_orig_params": use_orig_params,
+        }
+
+        wrap_module(self.module, FSDP, **wrapper_kwargs)
 
         # rate limitiing for backward and forward prefetching so that we don't fill up the stream
         backward_prefetch_limit = 1
@@ -243,6 +269,9 @@ class FSDP(nn.Module, _FSDPState):
     def print_module(self):
         for idx, m in enumerate(self.module.named_modules()):
             print(idx, "->", m)
+
+        for idx, c in enumerate(self.module.named_children()):
+            print(idx, "->", c)
 
 
 def main(rank, world_size, device):
