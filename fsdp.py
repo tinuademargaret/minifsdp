@@ -270,9 +270,6 @@ class FSDP(nn.Module, _FSDPState):
         for idx, m in enumerate(self.module.named_modules()):
             print(idx, "->", m)
 
-        for idx, c in enumerate(self.module.named_children()):
-            print(idx, "->", c)
-
 
 def main(rank, world_size, device):
     print(f"Hello from rank {rank} of {world_size} of {device}")
