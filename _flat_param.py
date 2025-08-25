@@ -826,12 +826,6 @@ class FlatParameterHandle:
 
     def prepare_gradient_for_optim(self):
 
-        def cast_grad_to_param_dtype(flat_param):
-            if flat_param.grad.dtype != self._fwd_bwd_param_dtype:
-                flat_param.grad.data = flat_param.grad.to(self._fwd_bwd_param_dtype)
-                if self._use_orig_params:
-                    self._use_sharded_grad_views()
-
         flat_param = self.flat_param
 
         if hasattr(flat_param, "_cpu_grad"):
@@ -841,14 +835,14 @@ class FlatParameterHandle:
             flat_param.grad = flat_param._cpu_grad
 
         elif hasattr(flat_param, "_saved_grad_shard"):
-            self._check_sharded(flat_param.grad)
+            self._check_sharded(flat_param)
             self._check_on_compute_device(flat_param)
             if flat_param._saved_grad_shard is not None:
                 self._check_on_compute_device(flat_param._saved_grad_shard)
             if flat_param._post_backward_called:
                 flat_param.grad = flat_param._saved_grad_shard
-                if flat_param.grad is not None:
-                    cast_grad_to_param_dtype(flat_param)
+                if flat_param.grad is not None and self._use_orig_params:
+                    self._use_sharded_grad_views()
         else:
             assert (
                 not self.uses_sharded_strategy or not flat_param._post_backward_called

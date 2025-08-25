@@ -245,13 +245,13 @@ class FSDP(nn.Module, _FSDPState):
             print(idx, "->", m)
 
 
-def main(rank, world_size, device_id):
-    print(f"Hello from rank {rank} of {world_size} of {device_id}")
+def main(rank, world_size, device):
+    print(f"Hello from rank {rank} of {world_size} of {device}")
     assert rank == dist.get_rank()
     assert world_size == dist.get_world_size()
     # deffered initialization of the model
     module = MLP().to(device="meta")
-    fsdp_model = FSDP(module, device_id=device_id, use_orig_params=True)
+    fsdp_model = FSDP(module, device_id=device, use_orig_params=True)
     fsdp_model.print_module()
     optimizer = torch.optim.SGD(fsdp_model.parameters())
     mse_loss = nn.MSELoss()
@@ -265,13 +265,20 @@ def main(rank, world_size, device_id):
         x = torch.empty((5000, 512))
         y = torch.empty((5000, 10))
 
-    x = x.to(device_id)
-    y = y.to(device_id)
+    x = x.to(device)
+    y = y.to(device)
 
     dist.broadcast(x, src=0)
     dist.broadcast(y, src=0)
 
     dataloader = DataloaderLite(bsz, x, y, rank, world_size)
+
+    start_time = torch.cuda.Event(enable_timing=True) if device.startswith('cuda') else torch.time.time()
+    end_time = torch.cuda.Event(enable_timing=True) if device.startswith('cuda') else None
+    if device.startswith('cuda'):
+        start_time.record()
+    else:
+        start_time = start_time()
 
     for i in range(epochs):
         for j in range(len(x) // (world_size * bsz)):
@@ -284,6 +291,17 @@ def main(rank, world_size, device_id):
             optimizer.step()
         if rank == 0:
             print(f"epoch: {i}, loss: {loss.item()}")
+    
+    # Record end time and compute duration based on device type
+    if device.startswith('cuda'):
+        end_time.record()
+        torch.cuda.synchronize()
+        duration = start_time.elapsed_time(end_time) / 1000  # Convert to seconds
+    else:
+        duration = torch.time.time() - start_time
+    
+    if rank == 0:
+        print(f"Training completed in {duration:.2f} seconds")
 
 
 # def run(rank, world_size, device=None):

@@ -39,6 +39,13 @@ def run(rank, world_size, device=None):
     dist.broadcast(y, src=0)
 
     dataloader = DataloaderLite(bsz, x, y, rank, world_size)
+   
+    start_time = torch.cuda.Event(enable_timing=True) if device.startswith('cuda') else torch.time.time()
+    end_time = torch.cuda.Event(enable_timing=True) if device.startswith('cuda') else None
+    if device.startswith('cuda'):
+        start_time.record()
+    else:
+        start_time = start_time()
 
     for i in range(epochs):
         for j in range(len(x) // (world_size * bsz)):
@@ -51,6 +58,17 @@ def run(rank, world_size, device=None):
             optimizer.step()
         if rank == 0:
             print(f"epoch: {i}, loss: {loss.item()}")
+
+    # Record end time and compute duration based on device type
+    if device.startswith('cuda'):
+        end_time.record()
+        torch.cuda.synchronize()
+        duration = start_time.elapsed_time(end_time) / 1000  # Convert to seconds
+    else:
+        duration = torch.time.time() - start_time
+    
+    if rank == 0:
+        print(f"Training completed in {duration:.2f} seconds")
 
 
 def init_process(rank=None, world_size=None, fn=None, backend="gloo", cuda=False):

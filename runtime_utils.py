@@ -71,6 +71,7 @@ class _ExecOrderData:
         self.all_handles = []
         self.param_to_fqn = {}
         self.current_order_index = 0
+        self.warn_status = _ExecOrderWarnStatus.NONE
 
     def init(self, root_module, process_group):
         self.process_group = process_group
@@ -509,6 +510,18 @@ def _post_backward_use_sharded_grad_views(handle):
         handle._reset_flat_param_grad_info_if_needed()
 
 
+def _accumulate_sharded_grad(state, handle, new_sharded_grad):      
+    flat_param = handle.flat_param
+
+    accumulate_grad = hasattr(flat_param, "_saved_grad_shard")
+
+    if accumulate_grad:
+        assert flat_param._saved_grad_shard.shape == new_sharded_grad.shape, f"Expected saved grad shard shape {flat_param._saved_grad_shard.shape} to match new sharded grad shape {new_sharded_grad.shape}"
+        assert flat_param._saved_grad_shard.device == new_sharded_grad.device, f"Expected saved grad shard device {flat_param._saved_grad_shard.device} to match new sharded grad device {new_sharded_grad.device}"
+        flat_param._saved_grad_shard += new_sharded_grad 
+    else:
+        flat_param._saved_grad_shard = new_sharded_grad
+
 def _reduce_grad(state, handle) -> None:
     """
     For sharded strategies, this runs gradient reduction, sharded gradient
@@ -535,6 +548,7 @@ def _reduce_grad(state, handle) -> None:
         state._comm_hook(
             state._comm_hook_state, padded_unsharded_grad, new_sharded_grad
         )
+    _accumulate_sharded_grad(state, handle, new_sharded_grad)
     _post_backward_use_sharded_grad_views(handle)
 
 
